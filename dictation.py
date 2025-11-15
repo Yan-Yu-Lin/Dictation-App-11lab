@@ -100,9 +100,10 @@ class DictationApp:
         self.connection = None
         self.last_partial_text = ""
         self.keyboard_controller = Controller()
-        self.audio_queue = Queue()  # Thread-safe queue for audio chunks
+        self.audio_queue = None  # Will be created per session
         self.mode = mode  # 'streaming' or 'batch'
         self.session_id = 0  # Track session number to handle parallel cleanup
+        self.current_sender_task = None  # Track the current send_audio_chunks task
 
         # Initialize ElevenLabs client
         api_key = os.getenv("ELEVENLABS_API_KEY")
@@ -135,6 +136,9 @@ class DictationApp:
         # Increment session ID for this new session
         self.session_id += 1
         current_session = self.session_id
+
+        # Create a NEW queue for this session (isolates from previous sessions)
+        self.audio_queue = Queue()
 
         # Play start sound
         play_sound(SOUND_START)
@@ -180,8 +184,8 @@ class DictationApp:
             )
             self.audio_stream.start_stream()
 
-            # Start the audio sender task
-            asyncio.create_task(self.send_audio_chunks())
+            # Start the audio sender task and keep reference
+            self.current_sender_task = asyncio.create_task(self.send_audio_chunks())
 
         except Exception as e:
             print(f"❌ Error starting audio stream: {e}")
@@ -227,13 +231,20 @@ class DictationApp:
 
         print("\n🛑 Recording stopped. Finalizing transcription...")
 
+        # CRITICAL: Immediately stop the audio stream to prevent callback pollution
+        if self.audio_stream:
+            self.audio_stream.stop_stream()
+            self.audio_stream.close()
+
         # Capture references to current session's resources
-        old_audio_stream = self.audio_stream
+        old_audio_stream = self.audio_stream  # Already stopped, but keep for cleanup
         old_connection = self.connection
+        old_queue = self.audio_queue
 
         # Clear references immediately so new session can start
         self.audio_stream = None
         self.connection = None
+        self.audio_queue = None
 
         # Clean up old session asynchronously in background
         asyncio.create_task(self._cleanup_session(old_audio_stream, old_connection))
@@ -241,12 +252,8 @@ class DictationApp:
     async def _cleanup_session(self, audio_stream, connection):
         """Clean up a session's resources in the background"""
         try:
-            # Stop audio stream
-            if audio_stream:
-                audio_stream.stop_stream()
-                audio_stream.close()
-
-            # Give the send task a moment to finish
+            # Audio stream is already stopped in stop_recording()
+            # Just give the send task a moment to finish sending queued audio
             await asyncio.sleep(0.2)
 
             # Commit and close connection
@@ -265,7 +272,7 @@ class DictationApp:
 
     def audio_callback(self, in_data, frame_count, time_info, status):
         """Callback for audio stream - put chunks in queue"""
-        if self.is_recording:
+        if self.is_recording and self.audio_queue is not None:
             # Put audio data in queue for async processing
             self.audio_queue.put(in_data)
 
@@ -363,6 +370,11 @@ class HotkeyMonitor(NSObject):
         self = objc_super(HotkeyMonitor, self).init()
         if self is None:
             return None
+
+        # Debouncing state
+        self.last_trigger_time = 0
+        self.debounce_interval = 0.3  # 300ms debounce
+
         return self
 
     def applicationDidFinishLaunching_(self, notification):
@@ -393,6 +405,14 @@ class HotkeyMonitor(NSObject):
         # Check for Cmd+Option+Control+D (hyper key + D)
         if key_char and key_char.lower() == TRIGGER_KEY.lower():
             if cmd and option and control and not shift:
+                # Debounce: Ignore if triggered too recently
+                import time
+                current_time = time.time()
+                if current_time - self.last_trigger_time < self.debounce_interval:
+                    return  # Ignore this trigger (key repeat)
+
+                self.last_trigger_time = current_time
+
                 # Trigger the hotkey action
                 if app and event_loop:
                     if not app.is_recording:
