@@ -8,6 +8,7 @@ import asyncio
 import base64
 import os
 import sys
+import subprocess
 import threading
 from queue import Queue, Empty
 from typing import Optional
@@ -29,8 +30,24 @@ CHUNK_SIZE = 4096  # Audio chunk size (0.25 seconds at 16kHz)
 AUDIO_FORMAT = pyaudio.paInt16  # 16-bit PCM
 CHANNELS = 1  # Mono
 
+# Sound effects (macOS system sounds)
+SOUND_START = "/System/Library/Sounds/Hero.aiff"  # Sound when recording starts
+SOUND_STOP = "/System/Library/Sounds/Glass.aiff"  # Sound when recording stops
+
 # Global state
 event_loop = None  # Store reference to the event loop
+
+
+def play_sound(sound_path):
+    """Play a system sound asynchronously (non-blocking)"""
+    try:
+        subprocess.Popen(
+            ["afplay", sound_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass  # Silently fail if sound can't be played
 
 
 class DictationApp:
@@ -65,6 +82,10 @@ class DictationApp:
 
         self.is_recording = True
         self.last_partial_text = ""
+
+        # Play start sound
+        play_sound(SOUND_START)
+
         print("\n🎙️  Recording started... Speak now!")
 
         # Connect to ElevenLabs Realtime API
@@ -143,6 +164,10 @@ class DictationApp:
             return
 
         self.is_recording = False
+
+        # Play stop sound
+        play_sound(SOUND_STOP)
+
         print("\n🛑 Recording stopped. Finalizing transcription...")
 
         # Stop audio stream
