@@ -15,6 +15,7 @@ from queue import Queue, Empty
 from typing import Optional
 
 import pyaudio
+import pyperclip
 from dotenv import load_dotenv
 from elevenlabs import AudioFormat, CommitStrategy, ElevenLabs, RealtimeEvents, RealtimeAudioOptions
 from pynput import keyboard
@@ -49,6 +50,34 @@ def play_sound(sound_path):
         )
     except Exception:
         pass  # Silently fail if sound can't be played
+
+
+def paste_text(text):
+    """Paste text using clipboard (much faster than typing)"""
+    try:
+        # Save current clipboard
+        old_clipboard = pyperclip.paste()
+
+        # Copy text to clipboard
+        pyperclip.copy(text)
+
+        # Simulate Cmd+V to paste
+        keyboard_controller = Controller()
+        keyboard_controller.press(Key.cmd)
+        keyboard_controller.press('v')
+        keyboard_controller.release('v')
+        keyboard_controller.release(Key.cmd)
+
+        # Small delay to ensure paste completes
+        import time
+        time.sleep(0.05)
+
+        # Restore old clipboard
+        pyperclip.copy(old_clipboard)
+    except Exception as e:
+        # Fallback to typing if paste fails
+        keyboard_controller = Controller()
+        keyboard_controller.type(text)
 
 
 class DictationApp:
@@ -228,8 +257,8 @@ class DictationApp:
                         self.keyboard_controller.press(Key.backspace)
                         self.keyboard_controller.release(Key.backspace)
 
-                # Type the new partial text
-                self.keyboard_controller.type(new_text)
+                # Paste the new partial text (much faster than typing)
+                paste_text(new_text)
                 self.last_partial_text = new_text
 
                 print(f"📝 Streaming: {new_text}")
@@ -251,12 +280,12 @@ class DictationApp:
                         self.keyboard_controller.press(Key.backspace)
                         self.keyboard_controller.release(Key.backspace)
 
-                # Type final text
-                self.keyboard_controller.type(final_text)
+                # Paste final text (faster than typing)
+                paste_text(final_text)
                 print(f"\n✅ Final: {final_text}\n")
             else:
-                # In batch mode, paste everything at once
-                self.keyboard_controller.type(final_text)
+                # In batch mode, paste everything at once using clipboard
+                paste_text(final_text)
                 print(f"\n✅ Pasted: {final_text}\n")
 
             self.last_partial_text = ""
