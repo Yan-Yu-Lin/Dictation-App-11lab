@@ -398,16 +398,16 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                    # Use default streaming mode
+  %(prog)s                    # Use default batch mode
+  %(prog)s --mode batch       # Wait until end to paste text (default)
   %(prog)s --mode streaming   # Real-time text streaming
-  %(prog)s --mode batch       # Wait until end to paste text
         """
     )
     parser.add_argument(
         '--mode',
         choices=['streaming', 'batch'],
-        default='streaming',
-        help='Transcription mode: streaming (real-time updates) or batch (paste at end)'
+        default='batch',
+        help='Transcription mode: streaming (real-time updates) or batch (paste at end, default)'
     )
 
     args = parser.parse_args()

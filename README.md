@@ -51,20 +51,20 @@ A real-time dictation tool that transcribes your speech as you speak using Eleve
 
 The app supports two modes:
 
-1. **Streaming mode (default)**: Text appears in real-time as you speak, with live updates
-2. **Batch mode**: Text appears only after you finish recording
+1. **Batch mode (default, recommended)**: Text appears only after you finish recording - fast and reliable
+2. **Streaming mode**: Text appears in real-time as you speak, with live updates
 
 Run the dictation app:
 
 ```bash
-# Default streaming mode
+# Default batch mode (recommended)
 uv run dictation.py
 
-# Explicit streaming mode
-uv run dictation.py --mode streaming
-
-# Batch mode (paste at end)
+# Explicit batch mode
 uv run dictation.py --mode batch
+
+# Streaming mode (real-time updates)
+uv run dictation.py --mode streaming
 ```
 
 Or activate the virtual environment first:
