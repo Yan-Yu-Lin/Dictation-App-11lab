@@ -90,6 +90,7 @@ class DictationApp:
         self.keyboard_controller = Controller()
         self.audio_queue = Queue()  # Thread-safe queue for audio chunks
         self.mode = mode  # 'streaming' or 'batch'
+        self.session_id = 0  # Track session number to handle parallel cleanup
 
         # Initialize ElevenLabs client
         api_key = os.getenv("ELEVENLABS_API_KEY")
@@ -118,6 +119,10 @@ class DictationApp:
         self.is_recording = True
         self.last_partial_text = ""
 
+        # Increment session ID for this new session
+        self.session_id += 1
+        current_session = self.session_id
+
         # Play start sound
         play_sound(SOUND_START)
 
@@ -125,7 +130,7 @@ class DictationApp:
 
         # Connect to ElevenLabs Realtime API
         try:
-            self.connection = await self.elevenlabs.speech_to_text.realtime.connect(
+            new_connection = await self.elevenlabs.speech_to_text.realtime.connect(
                 RealtimeAudioOptions(
                     model_id="scribe_v2_realtime",
                     audio_format=AudioFormat.PCM_16000,
@@ -136,11 +141,14 @@ class DictationApp:
             )
 
             # Set up event handlers
-            self.connection.on(RealtimeEvents.SESSION_STARTED, self.on_session_started)
-            self.connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, self.on_partial_transcript)
-            self.connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, self.on_committed_transcript)
-            self.connection.on(RealtimeEvents.ERROR, self.on_error)
-            self.connection.on(RealtimeEvents.CLOSE, self.on_close)
+            new_connection.on(RealtimeEvents.SESSION_STARTED, self.on_session_started)
+            new_connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, self.on_partial_transcript)
+            new_connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, self.on_committed_transcript)
+            new_connection.on(RealtimeEvents.ERROR, self.on_error)
+            new_connection.on(RealtimeEvents.CLOSE, self.on_close)
+
+            # Only assign to self.connection after successfully creating it
+            self.connection = new_connection
 
         except Exception as e:
             print(f"❌ Error connecting to ElevenLabs: {e}")
@@ -198,6 +206,7 @@ class DictationApp:
         if not self.is_recording:
             return
 
+        # Immediately stop recording to allow new session to start
         self.is_recording = False
 
         # Play stop sound
@@ -205,27 +214,41 @@ class DictationApp:
 
         print("\n🛑 Recording stopped. Finalizing transcription...")
 
-        # Stop audio stream
-        if self.audio_stream:
-            self.audio_stream.stop_stream()
-            self.audio_stream.close()
-            self.audio_stream = None
+        # Capture references to current session's resources
+        old_audio_stream = self.audio_stream
+        old_connection = self.connection
 
-        # Give the send task a moment to finish
-        await asyncio.sleep(0.2)
+        # Clear references immediately so new session can start
+        self.audio_stream = None
+        self.connection = None
 
-        # Commit and close connection
-        if self.connection:
-            try:
-                await self.connection.commit()
-                # Give it a moment to receive the committed transcript
-                await asyncio.sleep(0.5)
-                await self.connection.close()
-            except Exception as e:
-                print(f"⚠️  Error closing connection: {e}")
-            self.connection = None
+        # Clean up old session asynchronously in background
+        asyncio.create_task(self._cleanup_session(old_audio_stream, old_connection))
 
-        print("✅ Transcription complete!\n")
+    async def _cleanup_session(self, audio_stream, connection):
+        """Clean up a session's resources in the background"""
+        try:
+            # Stop audio stream
+            if audio_stream:
+                audio_stream.stop_stream()
+                audio_stream.close()
+
+            # Give the send task a moment to finish
+            await asyncio.sleep(0.2)
+
+            # Commit and close connection
+            if connection:
+                try:
+                    await connection.commit()
+                    # Give it a moment to receive the committed transcript
+                    await asyncio.sleep(0.5)
+                    await connection.close()
+                except Exception as e:
+                    print(f"⚠️  Error closing connection: {e}")
+
+            print("✅ Transcription complete!\n")
+        except Exception as e:
+            print(f"⚠️  Error during cleanup: {e}")
 
     def audio_callback(self, in_data, frame_count, time_info, status):
         """Callback for audio stream - put chunks in queue"""
