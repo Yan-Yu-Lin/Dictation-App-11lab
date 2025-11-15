@@ -4,6 +4,7 @@ Real-time dictation app using ElevenLabs Scribe v2 Realtime.
 Press hotkey to start/stop recording, transcription streams in real-time.
 """
 
+import argparse
 import asyncio
 import base64
 import os
@@ -51,7 +52,7 @@ def play_sound(sound_path):
 
 
 class DictationApp:
-    def __init__(self):
+    def __init__(self, mode='streaming'):
         self.is_recording = False
         self.audio_stream = None
         self.audio_interface = None
@@ -59,6 +60,7 @@ class DictationApp:
         self.last_partial_text = ""
         self.keyboard_controller = Controller()
         self.audio_queue = Queue()  # Thread-safe queue for audio chunks
+        self.mode = mode  # 'streaming' or 'batch'
 
         # Initialize ElevenLabs client
         api_key = os.getenv("ELEVENLABS_API_KEY")
@@ -72,8 +74,12 @@ class DictationApp:
         self.audio_interface = pyaudio.PyAudio()
 
         print("Dictation App Ready!")
-        print(f"Press Right Command (Hyper Key) + {TRIGGER_KEY.upper()} to start/stop recording")
-        print("Transcription will stream in real-time as you speak\n")
+        print(f"Mode: {mode.upper()}")
+        if mode == 'streaming':
+            print("Text will appear in real-time as you speak")
+        else:
+            print("Text will appear after you finish speaking")
+        print(f"Press Right Command (Hyper Key) + {TRIGGER_KEY.upper()} to start/stop recording\n")
 
     async def start_recording(self):
         """Start recording audio and connect to ElevenLabs"""
@@ -211,36 +217,48 @@ class DictationApp:
         if not new_text:
             return
 
-        # Calculate what's new since last update
-        if new_text != self.last_partial_text:
-            # Delete previous partial text by simulating backspaces
-            if self.last_partial_text:
-                num_backspaces = len(self.last_partial_text)
-                for _ in range(num_backspaces):
-                    self.keyboard_controller.press(Key.backspace)
-                    self.keyboard_controller.release(Key.backspace)
+        # Only stream in real-time if in streaming mode
+        if self.mode == 'streaming':
+            # Calculate what's new since last update
+            if new_text != self.last_partial_text:
+                # Delete previous partial text by simulating backspaces
+                if self.last_partial_text:
+                    num_backspaces = len(self.last_partial_text)
+                    for _ in range(num_backspaces):
+                        self.keyboard_controller.press(Key.backspace)
+                        self.keyboard_controller.release(Key.backspace)
 
-            # Type the new partial text
-            self.keyboard_controller.type(new_text)
+                # Type the new partial text
+                self.keyboard_controller.type(new_text)
+                self.last_partial_text = new_text
+
+                print(f"📝 Streaming: {new_text}")
+        else:
+            # In batch mode, just update internal state and show in console
             self.last_partial_text = new_text
-
-            print(f"📝 Streaming: {new_text}")
+            print(f"📝 Processing: {new_text}")
 
     def on_committed_transcript(self, data):
         """Called when final transcript is committed"""
         final_text = data.get('text', '').strip()
 
         if final_text:
-            # Replace partial text with final text
-            if self.last_partial_text:
-                num_backspaces = len(self.last_partial_text)
-                for _ in range(num_backspaces):
-                    self.keyboard_controller.press(Key.backspace)
-                    self.keyboard_controller.release(Key.backspace)
+            if self.mode == 'streaming':
+                # In streaming mode, replace partial text with final text
+                if self.last_partial_text:
+                    num_backspaces = len(self.last_partial_text)
+                    for _ in range(num_backspaces):
+                        self.keyboard_controller.press(Key.backspace)
+                        self.keyboard_controller.release(Key.backspace)
 
-            # Type final text
-            self.keyboard_controller.type(final_text)
-            print(f"\n✅ Final: {final_text}\n")
+                # Type final text
+                self.keyboard_controller.type(final_text)
+                print(f"\n✅ Final: {final_text}\n")
+            else:
+                # In batch mode, paste everything at once
+                self.keyboard_controller.type(final_text)
+                print(f"\n✅ Pasted: {final_text}\n")
+
             self.last_partial_text = ""
 
     def on_error(self, error):
@@ -305,7 +323,7 @@ def on_release(key):
         pressed_keys.remove(key)
 
 
-async def main():
+async def main(mode='streaming'):
     """Main event loop"""
     global app, event_loop
 
@@ -313,7 +331,7 @@ async def main():
     event_loop = asyncio.get_running_loop()
 
     # Create app instance
-    app = DictationApp()
+    app = DictationApp(mode=mode)
 
     # Set up keyboard listener (using regular Listener to detect specific keys)
     listener = keyboard.Listener(
@@ -338,7 +356,27 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description='Real-time dictation app using ElevenLabs Scribe v2 Realtime',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                    # Use default streaming mode
+  %(prog)s --mode streaming   # Real-time text streaming
+  %(prog)s --mode batch       # Wait until end to paste text
+        """
+    )
+    parser.add_argument(
+        '--mode',
+        choices=['streaming', 'batch'],
+        default='streaming',
+        help='Transcription mode: streaming (real-time updates) or batch (paste at end)'
+    )
+
+    args = parser.parse_args()
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(mode=args.mode))
     except KeyboardInterrupt:
         print("\nExited.")
