@@ -248,19 +248,24 @@ class DictationApp:
 
         # Only stream in real-time if in streaming mode
         if self.mode == 'streaming':
-            # Calculate what's new since last update
+            # Only type the NEW part that was added
             if new_text != self.last_partial_text:
-                # Delete previous partial text by simulating backspaces
-                if self.last_partial_text:
-                    num_backspaces = len(self.last_partial_text)
-                    for _ in range(num_backspaces):
-                        self.keyboard_controller.press(Key.backspace)
-                        self.keyboard_controller.release(Key.backspace)
+                # Check if new text starts with old text (append scenario)
+                if new_text.startswith(self.last_partial_text):
+                    # Only type the new characters added
+                    new_chars = new_text[len(self.last_partial_text):]
+                    if new_chars:
+                        self.keyboard_controller.type(new_chars)
+                else:
+                    # Text changed completely, delete old and type new
+                    if self.last_partial_text:
+                        num_backspaces = len(self.last_partial_text)
+                        for _ in range(num_backspaces):
+                            self.keyboard_controller.press(Key.backspace)
+                            self.keyboard_controller.release(Key.backspace)
+                    self.keyboard_controller.type(new_text)
 
-                # Paste the new partial text (much faster than typing)
-                paste_text(new_text)
                 self.last_partial_text = new_text
-
                 print(f"📝 Streaming: {new_text}")
         else:
             # In batch mode, just update internal state and show in console
@@ -274,14 +279,16 @@ class DictationApp:
         if final_text:
             if self.mode == 'streaming':
                 # In streaming mode, replace partial text with final text
-                if self.last_partial_text:
+                if self.last_partial_text and final_text != self.last_partial_text:
                     num_backspaces = len(self.last_partial_text)
                     for _ in range(num_backspaces):
                         self.keyboard_controller.press(Key.backspace)
                         self.keyboard_controller.release(Key.backspace)
-
-                # Paste final text (faster than typing)
-                paste_text(final_text)
+                    # Type final text
+                    self.keyboard_controller.type(final_text)
+                elif not self.last_partial_text:
+                    # No partial text, just type final
+                    self.keyboard_controller.type(final_text)
                 print(f"\n✅ Final: {final_text}\n")
             else:
                 # In batch mode, paste everything at once using clipboard
