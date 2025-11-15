@@ -195,28 +195,33 @@ class DictationApp:
 
     async def send_audio_chunks(self):
         """Send audio chunks from the queue to ElevenLabs"""
-        while self.is_recording:
-            try:
-                # Get audio chunk from queue (non-blocking with timeout)
+        try:
+            while self.is_recording:
                 try:
-                    audio_data = self.audio_queue.get(timeout=0.01)
-                except Empty:
+                    # Get audio chunk from queue (non-blocking with timeout)
+                    try:
+                        audio_data = self.audio_queue.get(timeout=0.01)
+                    except Empty:
+                        await asyncio.sleep(0.01)
+                        continue
+
+                    # Convert audio to base64
+                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+
+                    # Send to ElevenLabs
+                    if self.connection:
+                        await self.connection.send({
+                            "audio_base_64": audio_base64,
+                            "sample_rate": SAMPLE_RATE
+                        })
+
+                except Exception as e:
+                    print(f"⚠️  Error sending audio: {e}")
                     await asyncio.sleep(0.01)
-                    continue
 
-                # Convert audio to base64
-                audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-
-                # Send to ElevenLabs
-                if self.connection:
-                    await self.connection.send({
-                        "audio_base_64": audio_base64,
-                        "sample_rate": SAMPLE_RATE
-                    })
-
-            except Exception as e:
-                print(f"⚠️  Error sending audio: {e}")
-                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            # Task was cancelled, clean exit
+            pass
 
     async def stop_recording(self):
         """Stop recording and commit the transcript"""
@@ -230,6 +235,14 @@ class DictationApp:
         play_sound(SOUND_STOP)
 
         print("\n🛑 Recording stopped. Finalizing transcription...")
+
+        # CRITICAL: Cancel the sender task immediately to stop processing
+        if self.current_sender_task and not self.current_sender_task.done():
+            self.current_sender_task.cancel()
+            try:
+                await self.current_sender_task  # Wait for cancellation to complete
+            except asyncio.CancelledError:
+                pass  # Expected
 
         # CRITICAL: Immediately stop the audio stream to prevent callback pollution
         if self.audio_stream:
@@ -245,6 +258,7 @@ class DictationApp:
         self.audio_stream = None
         self.connection = None
         self.audio_queue = None
+        self.current_sender_task = None
 
         # Clean up old session asynchronously in background
         asyncio.create_task(self._cleanup_session(old_audio_stream, old_connection))
@@ -252,9 +266,8 @@ class DictationApp:
     async def _cleanup_session(self, audio_stream, connection):
         """Clean up a session's resources in the background"""
         try:
-            # Audio stream is already stopped in stop_recording()
-            # Just give the send task a moment to finish sending queued audio
-            await asyncio.sleep(0.2)
+            # Audio stream is already stopped and sender task is already cancelled in stop_recording()
+            # No need to wait - proceed directly to commit
 
             # Commit and close connection
             if connection:
@@ -371,9 +384,8 @@ class HotkeyMonitor(NSObject):
         if self is None:
             return None
 
-        # Debouncing state
-        self.last_trigger_time = 0
-        self.debounce_interval = 0.3  # 300ms debounce
+        # Track if hotkey combo is currently held (to prevent key repeat triggering)
+        self.hotkey_triggered = False
 
         return self
 
@@ -387,6 +399,24 @@ class HotkeyMonitor(NSObject):
             NSKeyDownMask,
             self.handleKeyEvent_
         )
+
+        # Monitor modifier flag changes to detect when keys are released
+        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSFlagsChangedMask,
+            self.handleFlagsChanged_
+        )
+
+    def handleFlagsChanged_(self, event):
+        """Detect when modifier keys are released to reset trigger state."""
+        modifiers = event.modifierFlags()
+
+        cmd = bool(modifiers & NSEventModifierFlagCommand)
+        option = bool(modifiers & NSEventModifierFlagOption)
+        control = bool(modifiers & NSEventModifierFlagControl)
+
+        # If any of the required modifiers is released, reset trigger state
+        if not (cmd and option and control):
+            self.hotkey_triggered = False
 
     def handleKeyEvent_(self, event):
         """Handle key down events and check for hotkey combination."""
@@ -405,13 +435,12 @@ class HotkeyMonitor(NSObject):
         # Check for Cmd+Option+Control+D (hyper key + D)
         if key_char and key_char.lower() == TRIGGER_KEY.lower():
             if cmd and option and control and not shift:
-                # Debounce: Ignore if triggered too recently
-                import time
-                current_time = time.time()
-                if current_time - self.last_trigger_time < self.debounce_interval:
-                    return  # Ignore this trigger (key repeat)
+                # Ignore if already triggered (prevents key repeat from firing multiple times)
+                if self.hotkey_triggered:
+                    return  # Ignore this event - we already triggered for this hold
 
-                self.last_trigger_time = current_time
+                # Mark as triggered (will be reset when modifiers are released)
+                self.hotkey_triggered = True
 
                 # Trigger the hotkey action
                 if app and event_loop:
