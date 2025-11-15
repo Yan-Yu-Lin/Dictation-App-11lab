@@ -133,10 +133,6 @@ class DictationApp:
     async def start_recording(self):
         """Start recording audio and connect to ElevenLabs"""
         async with self.session_lock:
-            # Wait for any previous cleanup to finish to avoid overlapping sessions
-            if self.cleanup_task and not self.cleanup_task.done():
-                await self.cleanup_task
-
             if self.is_recording:
                 return
 
@@ -156,60 +152,65 @@ class DictationApp:
 
             print("\n🎙️  Recording started... Speak now!")
 
-            # Connect to ElevenLabs Realtime API
-            try:
-                new_connection = await self.elevenlabs.speech_to_text.realtime.connect(
-                    RealtimeAudioOptions(
-                        model_id="scribe_v2_realtime",
-                        audio_format=AudioFormat.PCM_16000,
-                        sample_rate=SAMPLE_RATE,
-                        commit_strategy=CommitStrategy.MANUAL,
-                        include_timestamps=False,
-                    )
+        # Connect to ElevenLabs Realtime API (outside lock to keep hotkey responsive)
+        try:
+            new_connection = await self.elevenlabs.speech_to_text.realtime.connect(
+                RealtimeAudioOptions(
+                    model_id="scribe_v2_realtime",
+                    audio_format=AudioFormat.PCM_16000,
+                    sample_rate=SAMPLE_RATE,
+                    commit_strategy=CommitStrategy.MANUAL,
+                    include_timestamps=False,
                 )
+            )
 
-                # Set up event handlers
-                new_connection.on(RealtimeEvents.SESSION_STARTED, self.on_session_started)
-                new_connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, self.on_partial_transcript)
-                new_connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, self.on_committed_transcript)
-                new_connection.on(RealtimeEvents.ERROR, self.on_error)
-                new_connection.on(RealtimeEvents.CLOSE, self.on_close)
-
-                # Only assign to self.connection after successfully creating it
-                # Verify session is still current (protect against stale starts)
-                if self.active_session_id != current_session:
-                    await new_connection.close()
-                    return
-
-                self.connection = new_connection
-
-            except Exception as e:
-                print(f"❌ Error connecting to ElevenLabs: {e}")
-                self.is_recording = False
-                self.active_session_id = None
+            # If a stop happened during connect, drop this connection
+            if (not self.is_recording) or (self.active_session_id != current_session):
+                await new_connection.close()
                 return
 
-            # Start audio stream
-            try:
-                self.audio_stream = self.audio_interface.open(
-                    format=AUDIO_FORMAT,
-                    channels=CHANNELS,
-                    rate=SAMPLE_RATE,
-                    input=True,
-                    frames_per_buffer=CHUNK_SIZE,
-                    stream_callback=self.audio_callback
-                )
-                self.audio_stream.start_stream()
+            # Set up event handlers
+            new_connection.on(RealtimeEvents.SESSION_STARTED, self.on_session_started)
+            new_connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, self.on_partial_transcript)
+            new_connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, self.on_committed_transcript)
+            new_connection.on(RealtimeEvents.ERROR, self.on_error)
+            new_connection.on(RealtimeEvents.CLOSE, self.on_close)
 
-                # Start the audio sender task and keep reference
-                self.current_sender_task = asyncio.create_task(self.send_audio_chunks())
+            # Only assign to self.connection after successfully creating it
+            # Verify session is still current (protect against stale starts)
+            if self.active_session_id != current_session:
+                await new_connection.close()
+                return
 
-            except Exception as e:
-                print(f"❌ Error starting audio stream: {e}")
-                if self.connection:
-                    await self.connection.close()
-                self.is_recording = False
-                self.active_session_id = None
+            self.connection = new_connection
+
+        except Exception as e:
+            print(f"❌ Error connecting to ElevenLabs: {e}")
+            self.is_recording = False
+            self.active_session_id = None
+            return
+
+        # Start audio stream (outside the lock)
+        try:
+            self.audio_stream = self.audio_interface.open(
+                format=AUDIO_FORMAT,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=CHUNK_SIZE,
+                stream_callback=self.audio_callback
+            )
+            self.audio_stream.start_stream()
+
+            # Start the audio sender task and keep reference
+            self.current_sender_task = asyncio.create_task(self.send_audio_chunks())
+
+        except Exception as e:
+            print(f"❌ Error starting audio stream: {e}")
+            if self.connection:
+                await self.connection.close()
+            self.is_recording = False
+            self.active_session_id = None
 
     async def send_audio_chunks(self):
         """Send audio chunks from the queue to ElevenLabs"""
