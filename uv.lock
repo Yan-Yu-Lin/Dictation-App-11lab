@@ -82,6 +82,9 @@ dependencies = [
     { name = "elevenlabs" },
     { name = "pyaudio" },
     { name = "pynput" },
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
+    { name = "pyobjc-framework-quartz" },
     { name = "pyperclip" },
     { name = "python-dotenv" },
 ]
@@ -91,6 +94,9 @@ requires-dist = [
     { name = "elevenlabs", specifier = ">=2.23.0" },
     { name = "pyaudio", specifier = ">=0.2.14" },
     { name = "pynput", specifier = ">=1.8.1" },
+    { name = "pyobjc-core", specifier = ">=12.1" },
+    { name = "pyobjc-framework-cocoa", specifier = ">=12.1" },
+    { name = "pyobjc-framework-quartz", specifier = ">=12.1" },
     { name = "pyperclip", specifier = ">=1.11.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
 ]

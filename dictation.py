@@ -18,14 +18,26 @@ import pyaudio
 import pyperclip
 from dotenv import load_dotenv
 from elevenlabs import AudioFormat, CommitStrategy, ElevenLabs, RealtimeEvents, RealtimeAudioOptions
-from pynput import keyboard
 from pynput.keyboard import Controller, Key
+
+# PyObjC imports for NSEvent (hyper key support)
+from AppKit import NSApplication
+from Foundation import NSObject
+from Cocoa import (
+    NSEvent,
+    NSKeyDownMask,
+    NSEventModifierFlagCommand,
+    NSEventModifierFlagOption,
+    NSEventModifierFlagControl,
+    NSEventModifierFlagShift
+)
+from PyObjCTools import AppHelper
 
 # Load environment variables
 load_dotenv()
 
 # Configuration
-# Using Right Command + D (for hyper key setup)
+# Using Cmd+Option+Control+D (hyper key + D)
 TRIGGER_KEY = 'd'  # The key to press with hyper key
 SAMPLE_RATE = 16000  # 16kHz recommended by ElevenLabs
 CHUNK_SIZE = 4096  # Audio chunk size (0.25 seconds at 16kHz)
@@ -109,7 +121,8 @@ class DictationApp:
             print("Text will appear in real-time as you speak")
         else:
             print("Text will appear after you finish speaking")
-        print(f"Press Right Command (Hyper Key) + {TRIGGER_KEY.upper()} to start/stop recording\n")
+        print(f"Press Cmd+Option+Control+{TRIGGER_KEY.upper()} to start/stop recording")
+        print("(Or press your Hyper Key + D if you have it configured)\n")
 
     async def start_recording(self):
         """Start recording audio and connect to ElevenLabs"""
@@ -340,78 +353,99 @@ class DictationApp:
 # Global app instance
 app = None
 
-# Track pressed keys for hotkey detection
-pressed_keys = set()
-right_cmd_pressed = False
+
+class HotkeyMonitor(NSObject):
+    """Monitor for global hotkeys using NSEvent (detects hyper key after transformation)."""
+
+    def init(self):
+        """Initialize the hotkey monitor."""
+        from objc import super as objc_super
+        self = objc_super(HotkeyMonitor, self).init()
+        if self is None:
+            return None
+        return self
+
+    def applicationDidFinishLaunching_(self, notification):
+        """Set up event monitoring when app finishes launching."""
+        print("Hotkey monitor started. Press Cmd+Option+Control+D to toggle recording.")
+        print("Press Ctrl+C to exit.\n")
+
+        # Monitor key down events globally
+        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSKeyDownMask,
+            self.handleKeyEvent_
+        )
+
+    def handleKeyEvent_(self, event):
+        """Handle key down events and check for hotkey combination."""
+        global app, event_loop
+
+        # Get the key that was pressed
+        key_char = event.charactersIgnoringModifiers()
+        modifiers = event.modifierFlags()
+
+        # Extract modifier flags
+        cmd = bool(modifiers & NSEventModifierFlagCommand)
+        option = bool(modifiers & NSEventModifierFlagOption)
+        control = bool(modifiers & NSEventModifierFlagControl)
+        shift = bool(modifiers & NSEventModifierFlagShift)
+
+        # Check for Cmd+Option+Control+D (hyper key + D)
+        if key_char and key_char.lower() == TRIGGER_KEY.lower():
+            if cmd and option and control and not shift:
+                # Trigger the hotkey action
+                if app and event_loop:
+                    if not app.is_recording:
+                        asyncio.run_coroutine_threadsafe(app.start_recording(), event_loop)
+                    else:
+                        asyncio.run_coroutine_threadsafe(app.stop_recording(), event_loop)
 
 
-def on_press(key):
-    """Handle key press events"""
-    global app, event_loop, pressed_keys, right_cmd_pressed
-
-    # Track right command key (hyper key)
-    # On macOS, right command is Key.cmd_r
-    if hasattr(key, 'name') and key == keyboard.Key.cmd_r:
-        right_cmd_pressed = True
-
-    # Add key to pressed set
-    pressed_keys.add(key)
-
-    # Check if trigger key is pressed while right command is held
-    if right_cmd_pressed:
-        trigger_char = TRIGGER_KEY.lower()
-        if hasattr(key, 'char') and key.char and key.char.lower() == trigger_char:
-            # Trigger the hotkey action
-            if app and event_loop:
-                if not app.is_recording:
-                    asyncio.run_coroutine_threadsafe(app.start_recording(), event_loop)
-                else:
-                    asyncio.run_coroutine_threadsafe(app.stop_recording(), event_loop)
-
-
-def on_release(key):
-    """Handle key release events"""
-    global pressed_keys, right_cmd_pressed
-
-    # Track right command release
-    if hasattr(key, 'name') and key == keyboard.Key.cmd_r:
-        right_cmd_pressed = False
-
-    # Remove from pressed set
-    if key in pressed_keys:
-        pressed_keys.remove(key)
-
-
-async def main(mode='streaming'):
-    """Main event loop"""
+def setup_async_loop(mode):
+    """Set up the async event loop in a separate thread."""
     global app, event_loop
 
-    # Store reference to the event loop
-    event_loop = asyncio.get_running_loop()
+    # Create new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    event_loop = loop
 
     # Create app instance
     app = DictationApp(mode=mode)
 
-    # Set up keyboard listener (using regular Listener to detect specific keys)
-    listener = keyboard.Listener(
-        on_press=on_press,
-        on_release=on_release
-    )
-    listener.start()
+    # Run the event loop forever
+    loop.run_forever()
 
-    print("Listening for hotkey presses...")
-    print("Press Ctrl+C to exit\n")
 
-    # Keep the event loop running
+def start_app(mode='streaming'):
+    """Start the application with NSApplication event loop."""
+    # Start asyncio event loop in a separate thread
+    async_thread = threading.Thread(target=setup_async_loop, args=(mode,), daemon=True)
+    async_thread.start()
+
+    # Give the async thread a moment to initialize
+    import time
+    time.sleep(0.5)
+
+    # Create the NSApplication
+    ns_app = NSApplication.sharedApplication()
+
+    # Create and set the delegate (hotkey monitor)
+    delegate = HotkeyMonitor.alloc().init()
+    ns_app.setDelegate_(delegate)
+
+    # Run the NSApplication event loop (blocks until app quits)
     try:
-        while True:
-            await asyncio.sleep(0.1)
+        AppHelper.runEventLoop()
     except KeyboardInterrupt:
         print("\n\nShutting down...")
-        if app.is_recording:
-            await app.stop_recording()
-        app.cleanup()
-        listener.stop()
+        if app and app.is_recording:
+            # Schedule cleanup on the async loop
+            if event_loop:
+                asyncio.run_coroutine_threadsafe(app.stop_recording(), event_loop)
+                time.sleep(1)  # Give time for cleanup
+        if app:
+            app.cleanup()
 
 
 if __name__ == "__main__":
@@ -435,7 +469,5 @@ Examples:
 
     args = parser.parse_args()
 
-    try:
-        asyncio.run(main(mode=args.mode))
-    except KeyboardInterrupt:
-        print("\nExited.")
+    # Start the application
+    start_app(mode=args.mode)
