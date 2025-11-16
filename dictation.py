@@ -20,19 +20,13 @@ from dotenv import load_dotenv
 from elevenlabs import AudioFormat, CommitStrategy, ElevenLabs, RealtimeEvents, RealtimeAudioOptions
 from pynput.keyboard import Controller, Key
 
-# PyObjC imports for NSEvent (hyper key support)
+# QuickMacHotKey for global hotkey interception (blocks keypress from reaching other apps)
+from quickmachotkey import quickHotKey, mask
+from quickmachotkey.constants import kVK_ANSI_D, cmdKey, controlKey, optionKey
+
+# PyObjC imports for NSApplication
 from AppKit import NSApplication
 from Foundation import NSObject
-from Cocoa import (
-    NSEvent,
-    NSKeyDownMask,
-    NSKeyUpMask,
-    NSFlagsChangedMask,
-    NSEventModifierFlagCommand,
-    NSEventModifierFlagOption,
-    NSEventModifierFlagControl,
-    NSEventModifierFlagShift
-)
 from PyObjCTools import AppHelper
 
 # Load environment variables
@@ -413,96 +407,34 @@ class DictationApp:
 app = None
 
 
-class HotkeyMonitor(NSObject):
-    """Monitor for global hotkeys using NSEvent (detects hyper key after transformation)."""
+# Global hotkey handler using QuickMacHotKey
+# This automatically intercepts and blocks the hotkey from reaching other apps (like terminal)
+@quickHotKey(
+    virtualKey=kVK_ANSI_D,
+    modifierMask=mask(cmdKey, controlKey, optionKey)
+)
+def handle_hotkey():
+    """
+    Handle the global hotkey Cmd+Option+Control+D.
+    QuickMacHotKey automatically consumes the keypress, preventing it from reaching other apps.
+    """
+    global app, event_loop
 
-    def init(self):
-        """Initialize the hotkey monitor."""
-        from objc import super as objc_super
-        self = objc_super(HotkeyMonitor, self).init()
-        if self is None:
-            return None
+    if app and event_loop:
+        if not app.is_recording:
+            asyncio.run_coroutine_threadsafe(app.start_recording(), event_loop)
+        else:
+            asyncio.run_coroutine_threadsafe(app.stop_recording(), event_loop)
 
-        # Track if hotkey combo is currently held (to prevent key repeat triggering)
-        self.hotkey_triggered = False
 
-        return self
+class AppDelegate(NSObject):
+    """Simple app delegate for NSApplication."""
 
     def applicationDidFinishLaunching_(self, notification):
-        """Set up event monitoring when app finishes launching."""
+        """Set up when app finishes launching."""
         print("Hotkey monitor started. Press Cmd+Option+Control+D to toggle recording.")
+        print("(QuickMacHotKey will intercept the keypress - terminal won't see it)")
         print("Press Ctrl+C to exit.\n")
-
-        # Monitor key down events globally
-        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            NSKeyDownMask,
-            self.handleKeyEvent_
-        )
-
-        # Monitor key up events globally to reset trigger when D is released
-        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            NSKeyUpMask,
-            self.handleKeyUp_
-        )
-
-        # Monitor modifier flag changes to detect when keys are released
-        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            NSFlagsChangedMask,
-            self.handleFlagsChanged_
-        )
-
-    def handleFlagsChanged_(self, event):
-        """Detect when modifier keys are released to reset trigger state."""
-        modifiers = event.modifierFlags()
-
-        cmd = bool(modifiers & NSEventModifierFlagCommand)
-        option = bool(modifiers & NSEventModifierFlagOption)
-        control = bool(modifiers & NSEventModifierFlagControl)
-
-        # If any of the required modifiers is released, reset trigger state
-        if not (cmd and option and control):
-            self.hotkey_triggered = False
-
-    def handleKeyEvent_(self, event):
-        """Handle key down events and check for hotkey combination."""
-        global app, event_loop
-
-        # Get the key that was pressed
-        key_char = event.charactersIgnoringModifiers()
-        modifiers = event.modifierFlags()
-
-        # Extract modifier flags
-        cmd = bool(modifiers & NSEventModifierFlagCommand)
-        option = bool(modifiers & NSEventModifierFlagOption)
-        control = bool(modifiers & NSEventModifierFlagControl)
-        shift = bool(modifiers & NSEventModifierFlagShift)
-
-        # Check for Cmd+Option+Control+D (hyper key + D)
-        if key_char and key_char.lower() == TRIGGER_KEY.lower():
-            if cmd and option and control and not shift:
-                # Ignore OS key repeat events
-                if hasattr(event, "isARepeat") and event.isARepeat():
-                    return
-
-                # Ignore if already triggered (prevents key repeat from firing multiple times)
-                if self.hotkey_triggered:
-                    return  # Ignore this event - we already triggered for this hold
-
-                # Mark as triggered (will be reset when modifiers are released)
-                self.hotkey_triggered = True
-
-                # Trigger the hotkey action
-                if app and event_loop:
-                    if not app.is_recording:
-                        asyncio.run_coroutine_threadsafe(app.start_recording(), event_loop)
-                    else:
-                        asyncio.run_coroutine_threadsafe(app.stop_recording(), event_loop)
-
-    def handleKeyUp_(self, event):
-        """Reset trigger state when the trigger key is released."""
-        key_char = event.charactersIgnoringModifiers()
-        if key_char and key_char.lower() == TRIGGER_KEY.lower():
-            self.hotkey_triggered = False
 
 
 def setup_async_loop(mode):
@@ -534,8 +466,8 @@ def start_app(mode='streaming'):
     # Create the NSApplication
     ns_app = NSApplication.sharedApplication()
 
-    # Create and set the delegate (hotkey monitor)
-    delegate = HotkeyMonitor.alloc().init()
+    # Create and set the delegate
+    delegate = AppDelegate.alloc().init()
     ns_app.setDelegate_(delegate)
 
     # Run the NSApplication event loop (blocks until app quits)

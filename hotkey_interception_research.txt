@@ -1,0 +1,40 @@
+RESEARCH REQUEST: macOS Global Hotkey Interception in Python with PyObjC
+
+CONTEXT:
+I'm building a Python dictation app that uses PyObjC to monitor global hotkeys on macOS. Currently, I'm using NSEvent.addGlobalMonitorForEventsMatchingMask_handler_ to detect when the user presses Cmd+Option+Control+D.
+
+CURRENT PROBLEM:
+The hotkey detection works perfectly - my app correctly responds to the keypress. However, the keypress also "falls through" to the active application. For example, when the user is in a terminal (Ghostty), the terminal receives the same keypress and interprets it as an escape sequence `[8706;7u`, displaying weird characters.
+
+DESIRED BEHAVIOR:
+When the hotkey is pressed, I want to CONSUME/INTERCEPT/BLOCK the event so that:
+1. My Python app receives and handles the event
+2. The underlying application (terminal, browser, etc.) does NOT receive the event at all
+3. This should work system-wide, like how Raycast intercepts its hotkeys
+
+WHAT I NEED TO KNOW:
+1. Is addGlobalMonitorForEventsMatchingMask_ the wrong API for this? (I suspect it only observes but doesn't consume events)
+
+2. Should I be using CGEventTapCreate instead? If so:
+   - What are the exact steps to implement this in PyObjC/Python?
+   - What Quartz/Core Graphics imports do I need?
+   - How do I create an event tap that can filter/block specific key combinations?
+   - How do I return from the event tap callback to indicate "consume this event"?
+
+3. Are there any other macOS APIs I should consider for global hotkey interception that can block event propagation?
+
+4. What accessibility permissions are required, and how do I check/request them programmatically in Python?
+
+5. Please provide a code example in Python using PyObjC that shows:
+   - Setting up a global event tap
+   - Detecting Cmd+Option+Control+D specifically
+   - Blocking/consuming that event so it doesn't reach other apps
+   - Integrating with an existing NSApplication event loop
+
+CURRENT CODE STRUCTURE:
+- Using NSApplication.sharedApplication() with AppHelper.runEventLoop()
+- Asyncio running in a separate thread
+- HotkeyMonitor class as NSApplication delegate
+- Currently using addGlobalMonitorForEventsMatchingMask_ with NSKeyDownMask
+
+Please provide detailed technical guidance with code examples if possible.

@@ -1,0 +1,28 @@
+I need to detect a global hotkey in Python on macOS that works with hyper key remapping apps (like Karabiner-Elements or BetterTouchTool).
+
+CONTEXT:
+- I'm using pynput library in Python
+- I have a hyper key app that remaps Right Command → Cmd+Option+Control (simultaneously)
+- Currently using pynput.keyboard.Listener which detects the RAW Right Command key BEFORE the hyper key transformation
+- Other macOS apps correctly see Cmd+Option+Control because they listen AFTER the transformation
+- I want to detect Cmd+Option+Control+D hotkey combination
+
+PROBLEM:
+pynput seems to intercept at a low system level (CGEvent API?) before hyper key apps transform the key, so it sees "Right Command" instead of "Cmd+Option+Control"
+
+QUESTION:
+How can I make pynput (or another Python library) detect hotkeys AFTER hyper key transformation on macOS, so it sees Cmd+Option+Control+D instead of Right Command+D?
+
+Alternative approaches I'm open to:
+1. Different pynput configuration/API
+2. Different Python hotkey library that operates at higher system level
+3. macOS-specific solutions (AppleScript, NSEvent monitoring, etc.)
+4. Any Python library that works at the same level as regular macOS apps
+
+Requirements:
+- Must work on macOS
+- Must detect global hotkeys (work even when app is not focused)
+- Must see hyper key transformations like other apps do
+- Python-based solution preferred
+
+Please provide specific code examples or library recommendations with implementation details.

@@ -13,4 +13,5 @@ dependencies = [
     "pyobjc-framework-quartz>=12.1",
     "pyperclip>=1.11.0",
     "python-dotenv>=1.2.1",
+    "quickmachotkey>=2025.7.28",
 ]
