@@ -11,6 +11,7 @@ import os
 import sys
 import subprocess
 import threading
+import time
 from queue import Queue, Empty
 from typing import Optional
 
@@ -77,7 +78,6 @@ def paste_text(text):
         keyboard_controller.release(Key.cmd)
 
         # Small delay to ensure paste completes
-        import time
         time.sleep(0.2)
 
         # Restore old clipboard
@@ -460,7 +460,6 @@ def start_app(mode='streaming'):
     async_thread.start()
 
     # Give the async thread a moment to initialize
-    import time
     time.sleep(0.5)
 
     # Create the NSApplication
