@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Real-time dictation app using ElevenLabs Scribe v2 Realtime.
-Press hotkey to start/stop recording, transcription streams in real-time.
+Dictation app using ElevenLabs Scribe v2 Realtime.
+Press hotkey to start/stop recording, text is pasted when you finish speaking.
 """
 
-import argparse
 import asyncio
 import base64
 import os
@@ -90,15 +89,13 @@ def paste_text(text):
 
 
 class DictationApp:
-    def __init__(self, mode='streaming'):
+    def __init__(self):
         self.is_recording = False
         self.audio_stream = None
         self.audio_interface = None
         self.connection = None
         self.last_partial_text = ""
-        self.keyboard_controller = Controller()
         self.audio_queue = None  # Will be created per session
-        self.mode = mode  # 'streaming' or 'batch'
         self.session_id = 0  # Track session number to handle parallel cleanup
         self.current_sender_task = None  # Track the current send_audio_chunks task
         self.session_lock = asyncio.Lock()  # Serialize start/stop
@@ -117,11 +114,6 @@ class DictationApp:
         self.audio_interface = pyaudio.PyAudio()
 
         print("Dictation App Ready!")
-        print(f"Mode: {mode.upper()}")
-        if mode == 'streaming':
-            print("Text will appear in real-time as you speak")
-        else:
-            print("Text will appear after you finish speaking")
         print(f"Press Cmd+Option+Control+{TRIGGER_KEY.upper()} to start/stop recording")
         print("(Or press your Hyper Key + D if you have it configured)\n")
 
@@ -323,7 +315,7 @@ class DictationApp:
         print("🔌 Connected to ElevenLabs Scribe v2 Realtime")
 
     def on_partial_transcript(self, data):
-        """Called when partial transcript is received - stream text in real-time"""
+        """Called when partial transcript is received"""
         if self.active_session_id is None:
             return
         new_text = data.get('text', '').strip()
@@ -331,31 +323,9 @@ class DictationApp:
         if not new_text:
             return
 
-        # Only stream in real-time if in streaming mode
-        if self.mode == 'streaming':
-            # Only type the NEW part that was added (incremental update)
-            if new_text != self.last_partial_text:
-                # Check if new text starts with old text (append scenario)
-                if new_text.startswith(self.last_partial_text):
-                    # Only type the new characters added
-                    new_chars = new_text[len(self.last_partial_text):]
-                    if new_chars:
-                        self.keyboard_controller.type(new_chars)
-                else:
-                    # Text changed completely, delete old and type new
-                    if self.last_partial_text:
-                        num_backspaces = len(self.last_partial_text)
-                        for _ in range(num_backspaces):
-                            self.keyboard_controller.press(Key.backspace)
-                            self.keyboard_controller.release(Key.backspace)
-                    self.keyboard_controller.type(new_text)
-
-                self.last_partial_text = new_text
-                print(f"📝 Streaming: {new_text}")
-        else:
-            # In batch mode, just update internal state and show in console
-            self.last_partial_text = new_text
-            print(f"📝 Processing: {new_text}")
+        # Update internal state and show progress in console
+        self.last_partial_text = new_text
+        print(f"📝 Processing: {new_text}")
 
     def on_committed_transcript(self, data):
         """Called when final transcript is committed"""
@@ -364,24 +334,8 @@ class DictationApp:
         final_text = data.get('text', '').strip()
 
         if final_text:
-            if self.mode == 'streaming':
-                # In streaming mode, replace partial text with final text by typing
-                if self.last_partial_text and final_text != self.last_partial_text:
-                    num_backspaces = len(self.last_partial_text)
-                    for _ in range(num_backspaces):
-                        self.keyboard_controller.press(Key.backspace)
-                        self.keyboard_controller.release(Key.backspace)
-                    # Type final text
-                    self.keyboard_controller.type(final_text)
-                elif not self.last_partial_text:
-                    # No partial text, just type final
-                    self.keyboard_controller.type(final_text)
-                print(f"\n✅ Final: {final_text}\n")
-            else:
-                # In batch mode, paste everything at once using clipboard (works great!)
-                paste_text(final_text)
-                print(f"\n✅ Pasted: {final_text}\n")
-
+            paste_text(final_text)
+            print(f"\n✅ Pasted: {final_text}\n")
             self.last_partial_text = ""
 
     def on_error(self, error):
@@ -439,7 +393,7 @@ class AppDelegate(NSObject):
         print("Press Ctrl+C to exit.\n")
 
 
-def setup_async_loop(mode):
+def setup_async_loop():
     """Set up the async event loop in a separate thread."""
     global app, event_loop
 
@@ -449,7 +403,7 @@ def setup_async_loop(mode):
     event_loop = loop
 
     # Create app instance
-    app = DictationApp(mode=mode)
+    app = DictationApp()
 
     # Signal that initialization is complete
     async_loop_ready.set()
@@ -458,10 +412,10 @@ def setup_async_loop(mode):
     loop.run_forever()
 
 
-def start_app(mode='streaming'):
+def start_app():
     """Start the application with NSApplication event loop."""
     # Start asyncio event loop in a separate thread
-    async_thread = threading.Thread(target=setup_async_loop, args=(mode,), daemon=True)
+    async_thread = threading.Thread(target=setup_async_loop, daemon=True)
     async_thread.start()
 
     # Wait for the async thread to initialize
@@ -489,25 +443,4 @@ def start_app(mode='streaming'):
 
 
 if __name__ == "__main__":
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(
-        description='Real-time dictation app using ElevenLabs Scribe v2 Realtime',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s                    # Use default batch mode
-  %(prog)s --mode batch       # Wait until end to paste text (default)
-  %(prog)s --mode streaming   # Real-time text streaming
-        """
-    )
-    parser.add_argument(
-        '--mode',
-        choices=['streaming', 'batch'],
-        default='batch',
-        help='Transcription mode: streaming (real-time updates) or batch (paste at end, default)'
-    )
-
-    args = parser.parse_args()
-
-    # Start the application
-    start_app(mode=args.mode)
+    start_app()

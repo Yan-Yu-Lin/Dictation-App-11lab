@@ -6,23 +6,19 @@ A real-time dictation tool that transcribes your speech as you speak using Eleve
 
 ## Features
 
-- **Two transcription modes**:
-  - **Batch mode (default)**: Text appears after you finish speaking - fast and reliable
-  - **Streaming mode**: Text appears in real-time as you speak with live updates (Kinda buggy and slow, not recommended.)
 - **Global hotkey control**: Press Cmd+Option+Control+D to start/stop recording (works anywhere)
 - **Hotkey interception**: The hotkey is consumed by the app and won't reach other applications (no terminal escape sequences)
 - **Auto-paste**: Transcribed text is automatically pasted at your cursor position
 - **Low latency**: ~150ms transcription delay using Scribe v2 Realtime
 - **Sound feedback**: Audio cues when recording starts/stops
+- **Clipboard preservation**: Your clipboard contents are restored after pasting
 
 ## How It Works
 
 1. Press **Cmd+Option+Control+D** (or your configured Hyper Key + D) to start recording
-2. Speak naturally - you'll see partial transcripts streaming in the console
-3. In **batch mode**: Text is pasted all at once when you finish
-4. In **streaming mode**: Text appears in real-time as you speak
-5. Press **Cmd+Option+Control+D** again to stop recording and finalize the transcription
-6. The final, polished transcript is inserted at your cursor position
+2. Speak naturally - you'll see partial transcripts in the console
+3. Press **Cmd+Option+Control+D** again to stop recording
+4. The final transcript is automatically pasted at your cursor position
 
 ## Installation
 
@@ -68,32 +64,17 @@ macOS will prompt you for these permissions when you first run the app.
 
 ## Usage
 
-### Transcription Modes
-
-The app supports two modes:
-
-1. **Batch mode (default, recommended)**: Text appears only after you finish recording - fast and reliable using clipboard paste
-2. **Streaming mode**: Text appears in real-time as you speak, character by character
-
 Run the dictation app:
 
 ```bash
-# Default batch mode (recommended)
 uv run dictation.py
-
-# Explicit batch mode
-uv run dictation.py --mode batch
-
-# Streaming mode (real-time updates)
-uv run dictation.py --mode streaming
 ```
 
 Or activate the virtual environment first:
 
 ```bash
-source .venv/bin/activate  # On macOS
-
-python dictation.py --mode streaming  # or --mode batch
+source .venv/bin/activate
+python dictation.py
 ```
 
 ### Controls
@@ -112,7 +93,6 @@ python dictation.py --mode streaming  # or --mode batch
 - **Use in any text field**: The app pastes wherever your cursor is focused
 - **Wait for finalization**: Let the recording stop fully before editing
 - **Check your mic**: Make sure your microphone is working and has permissions
-- **Batch mode is faster**: Uses clipboard paste instead of typing character-by-character
 
 ## Configuration
 
@@ -154,11 +134,10 @@ uv sync
 2. Make sure no other app is using the same hotkey combination
 3. Try restarting the terminal app after granting permissions
 
-### Text not being typed/pasted
+### Text not being pasted
 
 1. Check that your terminal app has **Accessibility** permissions
 2. Verify the cursor is focused in a text field
-3. Try batch mode if streaming mode has issues
 
 ### No audio is being recorded
 
@@ -184,20 +163,12 @@ If you see characters like `[8706;7u` in your terminal when pressing the hotkey,
 
 ## How It Works (Technical Details)
 
-### Batch Mode (Default)
 1. Records audio while you speak
 2. Streams audio to ElevenLabs in real-time via WebSocket
-3. Receives partial transcripts (shown in console only)
+3. Receives partial transcripts (shown in console)
 4. When you stop recording, commits the final transcript
-5. **Pastes the text using clipboard** (Cmd+V) - much faster than typing
+5. Pastes the text using clipboard (Cmd+V)
 6. Restores your previous clipboard contents
-
-### Streaming Mode
-1. Records audio while you speak
-2. Streams audio to ElevenLabs in real-time via WebSocket
-3. **Receives partial transcripts and types them immediately**
-4. Updates text incrementally (only types new characters)
-5. When you stop recording, replaces partial text with final polished version
 
 ### Session Management
 - Uses unique session IDs to prevent race conditions
@@ -210,9 +181,7 @@ If you see characters like `[8706;7u` in your terminal when pressing the hotkey,
 - **Hotkey interception**: QuickMacHotKey for global hotkey detection and consumption
 - **Audio capture**: PyAudio for real-time microphone recording (16kHz PCM)
 - **Transcription**: ElevenLabs Scribe v2 Realtime WebSocket API
-- **Text insertion**:
-  - Batch mode: Clipboard paste via `pyperclip` + `pynput` (Cmd+V simulation)
-  - Streaming mode: Character-by-character typing via `pynput.keyboard.Controller`
+- **Text insertion**: Clipboard paste via `pyperclip` + `pynput` (Cmd+V simulation)
 - **Async I/O**: `asyncio` for concurrent audio streaming and transcription
 - **Event loop**: NSApplication event loop with asyncio running in separate thread
 
@@ -225,7 +194,6 @@ Scribe v2 Realtime costs approximately $0.39-$0.63 per hour of audio transcribed
 - **macOS only**: Uses macOS-specific APIs (QuickMacHotKey, NSApplication, PyObjC)
 - **Terminal permissions**: The terminal app running the script needs Microphone, Input Monitoring, and Accessibility permissions
 - **Single language per session**: Language is auto-detected but doesn't change mid-session
-- **Streaming mode backspace limitations**: Character-by-character replacement can be slow for long transcripts
 
 ## Credits
 
