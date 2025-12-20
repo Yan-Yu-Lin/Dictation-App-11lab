@@ -4,6 +4,7 @@ Dictation app using ElevenLabs Scribe v2 Realtime.
 Press hotkey to start/stop recording, text is pasted when you finish speaking.
 """
 
+import argparse
 import asyncio
 import base64
 import os
@@ -14,6 +15,7 @@ import time
 from queue import Queue, Empty
 from typing import Optional
 
+import opencc
 import pyaudio
 import pyperclip
 from dotenv import load_dotenv
@@ -89,7 +91,7 @@ def paste_text(text):
 
 
 class DictationApp:
-    def __init__(self):
+    def __init__(self, chinese='tw'):
         self.is_recording = False
         self.audio_stream = None
         self.audio_interface = None
@@ -101,6 +103,14 @@ class DictationApp:
         self.session_lock = asyncio.Lock()  # Serialize start/stop
         self.active_session_id: Optional[int] = None  # Identify which session events belong to
         self.cleanup_task: Optional[asyncio.Task] = None
+
+        # Initialize Chinese character converter
+        # s2t: Simplified to Traditional, t2s: Traditional to Simplified
+        self.chinese_variant = chinese
+        if chinese == 'tw':
+            self.chinese_converter = opencc.OpenCC('s2t')
+        else:
+            self.chinese_converter = opencc.OpenCC('t2s')
 
         # Initialize ElevenLabs client
         api_key = os.getenv("ELEVENLABS_API_KEY")
@@ -114,6 +124,7 @@ class DictationApp:
         self.audio_interface = pyaudio.PyAudio()
 
         print("Dictation App Ready!")
+        print(f"Chinese output: {'Traditional (TW)' if chinese == 'tw' else 'Simplified (CN)'}")
         print(f"Press Cmd+Option+Control+{TRIGGER_KEY.upper()} to start/stop recording")
         print("(Or press your Hyper Key + D if you have it configured)\n")
 
@@ -334,8 +345,10 @@ class DictationApp:
         final_text = data.get('text', '').strip()
 
         if final_text:
-            paste_text(final_text)
-            print(f"\n✅ Pasted: {final_text}\n")
+            # Convert Chinese characters if needed
+            converted_text = self.chinese_converter.convert(final_text)
+            paste_text(converted_text)
+            print(f"\n✅ Pasted: {converted_text}\n")
             self.last_partial_text = ""
 
     def on_error(self, error):
@@ -393,7 +406,7 @@ class AppDelegate(NSObject):
         print("Press Ctrl+C to exit.\n")
 
 
-def setup_async_loop():
+def setup_async_loop(chinese):
     """Set up the async event loop in a separate thread."""
     global app, event_loop
 
@@ -403,7 +416,7 @@ def setup_async_loop():
     event_loop = loop
 
     # Create app instance
-    app = DictationApp()
+    app = DictationApp(chinese=chinese)
 
     # Signal that initialization is complete
     async_loop_ready.set()
@@ -412,10 +425,10 @@ def setup_async_loop():
     loop.run_forever()
 
 
-def start_app():
+def start_app(chinese='tw'):
     """Start the application with NSApplication event loop."""
     # Start asyncio event loop in a separate thread
-    async_thread = threading.Thread(target=setup_async_loop, daemon=True)
+    async_thread = threading.Thread(target=setup_async_loop, args=(chinese,), daemon=True)
     async_thread.start()
 
     # Wait for the async thread to initialize
@@ -443,4 +456,14 @@ def start_app():
 
 
 if __name__ == "__main__":
-    start_app()
+    parser = argparse.ArgumentParser(
+        description='Dictation app using ElevenLabs Scribe v2 Realtime'
+    )
+    parser.add_argument(
+        '--chinese',
+        choices=['tw', 'cn'],
+        default='tw',
+        help='Chinese character variant: tw (Traditional, default) or cn (Simplified)'
+    )
+    args = parser.parse_args()
+    start_app(chinese=args.chinese)
