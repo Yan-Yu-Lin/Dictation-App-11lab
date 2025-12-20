@@ -78,7 +78,7 @@ def paste_text(text):
 
         # Small delay to ensure paste completes
         import time
-        time.sleep(0.05)
+        time.sleep(0.2)
 
         # Restore old clipboard
         pyperclip.copy(old_clipboard)
@@ -291,7 +291,7 @@ class DictationApp:
                 try:
                     await connection.commit()
                     # Give it a moment to receive the committed transcript
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.0)
                     await connection.close()
                 except Exception as e:
                     print(f"⚠️  Error closing connection: {e}")
