@@ -47,6 +47,7 @@ SOUND_STOP = "/System/Library/Sounds/Glass.aiff"  # Sound when recording stops
 
 # Global state
 event_loop = None  # Store reference to the event loop
+async_loop_ready = threading.Event()  # Signals when async loop is initialized
 
 
 def play_sound(sound_path):
@@ -308,9 +309,10 @@ class DictationApp:
 
     def audio_callback(self, in_data, frame_count, time_info, status):
         """Callback for audio stream - put chunks in queue"""
-        if self.is_recording and self.audio_queue is not None:
-            # Put audio data in queue for async processing
-            self.audio_queue.put(in_data)
+        # Capture reference locally to prevent race condition
+        queue = self.audio_queue
+        if self.is_recording and queue is not None:
+            queue.put(in_data)
 
         return (in_data, pyaudio.paContinue)
 
@@ -449,6 +451,9 @@ def setup_async_loop(mode):
     # Create app instance
     app = DictationApp(mode=mode)
 
+    # Signal that initialization is complete
+    async_loop_ready.set()
+
     # Run the event loop forever
     loop.run_forever()
 
@@ -459,8 +464,8 @@ def start_app(mode='streaming'):
     async_thread = threading.Thread(target=setup_async_loop, args=(mode,), daemon=True)
     async_thread.start()
 
-    # Give the async thread a moment to initialize
-    time.sleep(0.5)
+    # Wait for the async thread to initialize
+    async_loop_ready.wait()
 
     # Create the NSApplication
     ns_app = NSApplication.sharedApplication()
