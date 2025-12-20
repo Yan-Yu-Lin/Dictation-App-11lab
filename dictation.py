@@ -79,8 +79,8 @@ def paste_text(text):
         keyboard_controller.release('v')
         keyboard_controller.release(Key.cmd)
 
-        # Small delay to ensure paste completes
-        time.sleep(0.2)
+        # Delay before restoring clipboard (gives time for paste and clipboard managers)
+        time.sleep(0.6)
 
         # Restore old clipboard
         pyperclip.copy(old_clipboard)
