@@ -31,10 +31,21 @@ from pynput.keyboard import Controller, Key
 
 # QuickMacHotKey for global hotkey interception (blocks keypress from reaching other apps)
 from quickmachotkey import quickHotKey, mask
-from quickmachotkey.constants import kVK_ANSI_D, cmdKey, controlKey, optionKey
+from quickmachotkey.constants import (
+    kVK_ANSI_D,
+    kVK_RightShift,
+    cmdKey,
+    controlKey,
+    optionKey,
+)
 
 # PyObjC imports for NSApplication
-from AppKit import NSApplication
+from AppKit import (
+    NSApplication,
+    NSEvent,
+    NSEventMaskFlagsChanged,
+    NSEventModifierFlagShift,
+)
 from Foundation import NSObject
 from PyObjCTools import AppHelper
 
@@ -596,6 +607,79 @@ class DictationApp:
 
 # Global app instance
 app = None
+right_shift_ptt_monitor = None
+right_shift_ptt_enabled = True
+
+
+class RightShiftPTTMonitor:
+    """Global right-shift push-to-talk monitor."""
+
+    def __init__(self):
+        self.monitor_token = None
+        self.right_shift_down = False
+        self.started_session = False
+
+    def start(self):
+        if self.monitor_token is not None:
+            return
+        self.monitor_token = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskFlagsChanged,
+            self._handle_flags_changed,
+        )
+        print("Right Shift push-to-talk enabled (hold to record)")
+
+    def stop(self):
+        if self.monitor_token is not None:
+            NSEvent.removeMonitor_(self.monitor_token)
+            self.monitor_token = None
+        self.right_shift_down = False
+        self.started_session = False
+
+    async def _stop_when_possible(self):
+        """Stop recording after a right-shift release, even if start is still in flight."""
+        global app
+        for _ in range(25):
+            if self.right_shift_down:
+                return
+            if app and app.is_recording:
+                await app.stop_recording()
+                return
+            await asyncio.sleep(0.02)
+
+    def _handle_flags_changed(self, event):
+        """Handle global modifier changes and detect right-shift hold/release."""
+        global app, event_loop
+
+        try:
+            if event.keyCode() != kVK_RightShift:
+                return
+
+            # NSEvent exposes Shift as a combined modifier flag.
+            # keyCode() above scopes this transition specifically to Right Shift.
+            is_down = bool(event.modifierFlags() & NSEventModifierFlagShift)
+            if is_down == self.right_shift_down:
+                return
+
+            self.right_shift_down = is_down
+
+            if not app or not event_loop:
+                return
+
+            if is_down:
+                if not app.is_recording:
+                    self.started_session = True
+                    asyncio.run_coroutine_threadsafe(app.start_recording(), event_loop)
+                else:
+                    self.started_session = False
+            else:
+                if self.started_session:
+                    self.started_session = False
+                    asyncio.run_coroutine_threadsafe(
+                        self._stop_when_possible(),
+                        event_loop,
+                    )
+        except Exception as e:
+            print(f"⚠️  Right Shift PTT monitor error: {e}")
 
 
 # Global hotkey handler using QuickMacHotKey
@@ -620,7 +704,15 @@ class AppDelegate(NSObject):
 
     def applicationDidFinishLaunching_(self, notification):
         """Set up when app finishes launching."""
+        global right_shift_ptt_monitor, right_shift_ptt_enabled
+
+        if right_shift_ptt_enabled:
+            right_shift_ptt_monitor = RightShiftPTTMonitor()
+            right_shift_ptt_monitor.start()
+
         print("Hotkey monitor started. Press Cmd+Option+Control+D to toggle recording.")
+        if right_shift_ptt_enabled:
+            print("Hold Right Shift for push-to-talk.")
         print("(QuickMacHotKey will intercept the keypress - terminal won't see it)")
         print("Press Ctrl+C to exit.\n")
 
@@ -644,8 +736,13 @@ def setup_async_loop(chinese):
     loop.run_forever()
 
 
-def start_app(chinese="tw"):
+def start_app(chinese="tw", enable_right_shift_ptt=True):
     """Start the application with NSApplication event loop."""
+    global right_shift_ptt_enabled, right_shift_ptt_monitor
+
+    right_shift_ptt_enabled = enable_right_shift_ptt
+    right_shift_ptt_monitor = None
+
     # Start asyncio event loop in a separate thread
     async_thread = threading.Thread(
         target=setup_async_loop, args=(chinese,), daemon=True
@@ -672,6 +769,9 @@ def start_app(chinese="tw"):
             if event_loop:
                 asyncio.run_coroutine_threadsafe(app.stop_recording(), event_loop)
                 time.sleep(1)  # Give time for cleanup
+    finally:
+        if right_shift_ptt_monitor:
+            right_shift_ptt_monitor.stop()
         if app:
             app.cleanup()
 
@@ -686,5 +786,13 @@ if __name__ == "__main__":
         default="tw",
         help="Chinese character variant: tw (Traditional, default) or cn (Simplified)",
     )
+    parser.add_argument(
+        "--disable-right-shift-ptt",
+        action="store_true",
+        help="Disable hold-to-talk on Right Shift (Cmd+Option+Control+D toggle stays enabled)",
+    )
     args = parser.parse_args()
-    start_app(chinese=args.chinese)
+    start_app(
+        chinese=args.chinese,
+        enable_right_shift_ptt=not args.disable_right_shift_ptt,
+    )

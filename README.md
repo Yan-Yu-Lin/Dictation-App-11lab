@@ -7,6 +7,7 @@ A real-time dictation tool that transcribes your speech as you speak using Eleve
 ## Features
 
 - **Global hotkey control**: Press Cmd+Option+Control+D to start/stop recording (works anywhere)
+- **Push-to-talk**: Hold **Right Shift** to record, release to stop
 - **Hotkey interception**: The hotkey is consumed by the app and won't reach other applications (no terminal escape sequences)
 - **Auto-paste**: Transcribed text is automatically pasted at your cursor position
 - **Low latency**: ~150ms transcription delay using Scribe v2 Realtime
@@ -71,6 +72,12 @@ Run the dictation app:
 uv run dictation.py
 ```
 
+Disable Right Shift push-to-talk if needed:
+
+```bash
+uv run dictation.py --disable-right-shift-ptt
+```
+
 Or activate the virtual environment first:
 
 ```bash
@@ -81,6 +88,7 @@ python dictation.py
 ### Controls
 
 - **Cmd+Option+Control+D**: Toggle recording on/off (also works as Hyper Key + D if you have it configured)
+- **Right Shift (hold)**: Push-to-talk start while held, stop on release
 - **Ctrl+C**: Exit the application
 
 ### Sound Feedback
