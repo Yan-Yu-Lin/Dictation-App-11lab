@@ -42,11 +42,21 @@ from quickmachotkey.constants import (
 # PyObjC imports for NSApplication
 from AppKit import (
     NSApplication,
+    NSBackingStoreBuffered,
+    NSColor,
     NSEvent,
     NSEventMaskFlagsChanged,
     NSEventModifierFlagShift,
+    NSFloatingWindowLevel,
+    NSFont,
+    NSPanel,
+    NSScreen,
+    NSTextField,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowStyleMaskBorderless,
 )
-from Foundation import NSObject
+from Foundation import NSMakeRect, NSObject
 from PyObjCTools import AppHelper
 
 # Load environment variables
@@ -65,22 +75,139 @@ FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
 LOCAL_PUNC_MODEL_ID = "ct-punc"
 
 # Sound effects (macOS system sounds)
-SOUND_START = "/System/Library/Sounds/Hero.aiff"  # Sound when recording starts
-SOUND_STOP = "/System/Library/Sounds/Glass.aiff"  # Sound when recording stops
+SOUND_START = "/System/Library/Sounds/Pop.aiff"  # Sound when recording starts
+SOUND_STOP = "/System/Library/Sounds/Tink.aiff"  # Sound when recording stops
+SOUND_START_VOLUME = 0.25
+SOUND_STOP_VOLUME = 0.25
 
 # Global state
 event_loop = None  # Store reference to the event loop
 async_loop_ready = threading.Event()  # Signals when async loop is initialized
+status_overlay = None
 
 
-def play_sound(sound_path):
+def play_sound(sound_path, volume=0.25):
     """Play a system sound asynchronously (non-blocking)"""
     try:
+        safe_volume = max(0.0, min(1.0, float(volume)))
         subprocess.Popen(
-            ["afplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            ["afplay", "-v", str(safe_volume), sound_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except Exception:
         pass  # Silently fail if sound can't be played
+
+
+def set_overlay_recording():
+    global status_overlay
+    if status_overlay:
+        AppHelper.callAfter(status_overlay.show_recording)
+
+
+def set_overlay_finalizing():
+    global status_overlay
+    if status_overlay:
+        AppHelper.callAfter(status_overlay.show_finalizing)
+
+
+def hide_overlay():
+    global status_overlay
+    if status_overlay:
+        AppHelper.callAfter(status_overlay.hide)
+
+
+class StatusOverlay(NSObject):
+    """Small always-on-top status chip for dictation state."""
+
+    WIDTH = 220
+    HEIGHT = 40
+    TOP_MARGIN = 26
+
+    def init(self):
+        self = super().init()
+        if self is None:
+            return None
+
+        self.panel = None
+        self.label = None
+        self._create_panel()
+        return self
+
+    def _screen_rect(self):
+        screen = NSScreen.mainScreen()
+        if screen is None:
+            return NSMakeRect(40, 40, self.WIDTH, self.HEIGHT)
+        frame = screen.visibleFrame()
+        x = frame.origin.x + (frame.size.width - self.WIDTH) / 2
+        y = frame.origin.y + frame.size.height - self.HEIGHT - self.TOP_MARGIN
+        return NSMakeRect(x, y, self.WIDTH, self.HEIGHT)
+
+    def _create_panel(self):
+        frame = self._screen_rect()
+        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            frame,
+            NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self.panel.setFloatingPanel_(True)
+        self.panel.setLevel_(NSFloatingWindowLevel)
+        self.panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+        self.panel.setOpaque_(False)
+        self.panel.setHasShadow_(True)
+        self.panel.setBackgroundColor_(NSColor.clearColor())
+        self.panel.setIgnoresMouseEvents_(True)
+
+        content = self.panel.contentView()
+        content.setWantsLayer_(True)
+        layer = content.layer()
+        layer.setCornerRadius_(14.0)
+        layer.setBackgroundColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.10, 0.10, 0.12, 0.82
+            ).CGColor()
+        )
+
+        self.label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(12, 10, self.WIDTH - 24, 20)
+        )
+        self.label.setEditable_(False)
+        self.label.setSelectable_(False)
+        self.label.setBezeled_(False)
+        self.label.setDrawsBackground_(False)
+        self.label.setAlignment_(1)
+        self.label.setFont_(NSFont.boldSystemFontOfSize_(13.0))
+        content.addSubview_(self.label)
+
+        self.hide()
+
+    def _set_text(self, text, color):
+        if not self.label:
+            return
+        self.label.setStringValue_(text)
+        self.label.setTextColor_(color)
+
+    def show_recording(self):
+        if not self.panel:
+            return
+        self._set_text("● Listening", NSColor.systemRedColor())
+        self.panel.setFrame_display_(self._screen_rect(), True)
+        self.panel.orderFrontRegardless()
+
+    def show_finalizing(self):
+        if not self.panel:
+            return
+        self._set_text("● Finalizing...", NSColor.systemOrangeColor())
+        self.panel.setFrame_display_(self._screen_rect(), True)
+        self.panel.orderFrontRegardless()
+
+    def hide(self):
+        if self.panel:
+            self.panel.orderOut_(None)
 
 
 def paste_text(text):
@@ -253,12 +380,14 @@ class DictationApp:
             self.audio_stream.start_stream()
 
             # Only play start sound after mic is actually active
-            play_sound(SOUND_START)
+            play_sound(SOUND_START, SOUND_START_VOLUME)
+            set_overlay_recording()
             print("\n🎙️  Recording started. Listening now...")
             print("🔄 Connecting to ElevenLabs realtime...")
 
         except Exception as e:
             print(f"❌ Error starting audio stream: {e}")
+            hide_overlay()
             async with self.session_lock:
                 if self.active_session_id == current_session:
                     self.is_recording = False
@@ -337,6 +466,7 @@ class DictationApp:
             print(
                 f"❌ Timed out connecting to ElevenLabs after {CONNECT_TIMEOUT_SECONDS:.1f}s"
             )
+            hide_overlay()
             if self.audio_stream:
                 self.audio_stream.stop_stream()
                 self.audio_stream.close()
@@ -351,6 +481,7 @@ class DictationApp:
             return
         except Exception as e:
             print(f"❌ Error connecting to ElevenLabs: {e}")
+            hide_overlay()
             if self.audio_stream:
                 self.audio_stream.stop_stream()
                 self.audio_stream.close()
@@ -403,7 +534,8 @@ class DictationApp:
             self.is_recording = False
 
             # Play stop sound
-            play_sound(SOUND_STOP)
+            play_sound(SOUND_STOP, SOUND_STOP_VOLUME)
+            set_overlay_finalizing()
 
             print("\n🛑 Recording stopped. Finalizing transcription...")
 
@@ -501,6 +633,7 @@ class DictationApp:
         finally:
             self.commit_events.pop(session_to_cleanup, None)
             self.pasted_sessions.discard(session_to_cleanup)
+            hide_overlay()
             # Clear active session only if this cleanup belongs to the active one
             if self.active_session_id == session_to_cleanup:
                 self.active_session_id = None
@@ -704,7 +837,9 @@ class AppDelegate(NSObject):
 
     def applicationDidFinishLaunching_(self, notification):
         """Set up when app finishes launching."""
-        global right_shift_ptt_monitor, right_shift_ptt_enabled
+        global right_shift_ptt_monitor, right_shift_ptt_enabled, status_overlay
+
+        status_overlay = StatusOverlay.alloc().init()
 
         if right_shift_ptt_enabled:
             right_shift_ptt_monitor = RightShiftPTTMonitor()
@@ -770,8 +905,11 @@ def start_app(chinese="tw", enable_right_shift_ptt=True):
                 asyncio.run_coroutine_threadsafe(app.stop_recording(), event_loop)
                 time.sleep(1)  # Give time for cleanup
     finally:
+        global status_overlay
         if right_shift_ptt_monitor:
             right_shift_ptt_monitor.stop()
+        hide_overlay()
+        status_overlay = None
         if app:
             app.cleanup()
 
