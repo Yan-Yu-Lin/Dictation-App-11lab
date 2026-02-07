@@ -47,13 +47,15 @@ from AppKit import (
     NSEvent,
     NSEventMaskFlagsChanged,
     NSEventModifierFlagShift,
-    NSFloatingWindowLevel,
-    NSFont,
     NSPanel,
     NSScreen,
-    NSTextField,
+    NSStatusWindowLevel,
+    NSView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowCollectionBehaviorIgnoresCycle,
+    NSWindowCollectionBehaviorStationary,
+    NSWindowCollectionBehaviorTransient,
     NSWindowStyleMaskBorderless,
 )
 from Foundation import NSMakeRect, NSObject
@@ -118,11 +120,12 @@ def hide_overlay():
 
 
 class StatusOverlay(NSObject):
-    """Small always-on-top status chip for dictation state."""
+    """Small always-on-top circular indicator for dictation state."""
 
-    WIDTH = 220
-    HEIGHT = 40
-    TOP_MARGIN = 26
+    WIDTH = 30
+    HEIGHT = 30
+    TOP_MARGIN = 18
+    DOT_SIZE = 10
 
     def init(self):
         self = super().init()
@@ -130,12 +133,26 @@ class StatusOverlay(NSObject):
             return None
 
         self.panel = None
-        self.label = None
+        self.dot_view = None
         self._create_panel()
         return self
 
     def _screen_rect(self):
-        screen = NSScreen.mainScreen()
+        point = NSEvent.mouseLocation()
+        screen = None
+        for candidate in NSScreen.screens():
+            frame = candidate.frame()
+            min_x = frame.origin.x
+            min_y = frame.origin.y
+            max_x = frame.origin.x + frame.size.width
+            max_y = frame.origin.y + frame.size.height
+            if min_x <= point.x <= max_x and min_y <= point.y <= max_y:
+                screen = candidate
+                break
+
+        if screen is None:
+            screen = NSScreen.mainScreen()
+
         if screen is None:
             return NSMakeRect(40, 40, self.WIDTH, self.HEIGHT)
         frame = screen.visibleFrame()
@@ -152,56 +169,62 @@ class StatusOverlay(NSObject):
             False,
         )
         self.panel.setFloatingPanel_(True)
-        self.panel.setLevel_(NSFloatingWindowLevel)
+        self.panel.setLevel_(NSStatusWindowLevel)
         self.panel.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorTransient
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorIgnoresCycle
         )
         self.panel.setOpaque_(False)
         self.panel.setHasShadow_(True)
         self.panel.setBackgroundColor_(NSColor.clearColor())
         self.panel.setIgnoresMouseEvents_(True)
+        self.panel.setHidesOnDeactivate_(False)
 
         content = self.panel.contentView()
         content.setWantsLayer_(True)
         layer = content.layer()
-        layer.setCornerRadius_(14.0)
+        layer.setCornerRadius_(self.WIDTH / 2)
+        layer.setMasksToBounds_(True)
         layer.setBackgroundColor_(
             NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                0.10, 0.10, 0.12, 0.82
+                0.02, 0.02, 0.03, 0.96
             ).CGColor()
         )
 
-        self.label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, 10, self.WIDTH - 24, 20)
+        dot_x = (self.WIDTH - self.DOT_SIZE) / 2
+        dot_y = (self.HEIGHT - self.DOT_SIZE) / 2
+        self.dot_view = NSView.alloc().initWithFrame_(
+            NSMakeRect(dot_x, dot_y, self.DOT_SIZE, self.DOT_SIZE)
         )
-        self.label.setEditable_(False)
-        self.label.setSelectable_(False)
-        self.label.setBezeled_(False)
-        self.label.setDrawsBackground_(False)
-        self.label.setAlignment_(1)
-        self.label.setFont_(NSFont.boldSystemFontOfSize_(13.0))
-        content.addSubview_(self.label)
+        self.dot_view.setWantsLayer_(True)
+        dot_layer = self.dot_view.layer()
+        dot_layer.setCornerRadius_(self.DOT_SIZE / 2)
+        dot_layer.setBackgroundColor_(NSColor.systemRedColor().CGColor())
+        content.addSubview_(self.dot_view)
 
         self.hide()
 
-    def _set_text(self, text, color):
-        if not self.label:
+    def _set_dot_color(self, color):
+        if not self.dot_view:
             return
-        self.label.setStringValue_(text)
-        self.label.setTextColor_(color)
+        dot_layer = self.dot_view.layer()
+        if dot_layer:
+            dot_layer.setBackgroundColor_(color.CGColor())
 
     def show_recording(self):
         if not self.panel:
             return
-        self._set_text("● Listening", NSColor.systemRedColor())
+        self._set_dot_color(NSColor.systemRedColor())
         self.panel.setFrame_display_(self._screen_rect(), True)
         self.panel.orderFrontRegardless()
 
     def show_finalizing(self):
         if not self.panel:
             return
-        self._set_text("● Finalizing...", NSColor.systemOrangeColor())
+        self._set_dot_color(NSColor.systemOrangeColor())
         self.panel.setFrame_display_(self._screen_rect(), True)
         self.panel.orderFrontRegardless()
 
