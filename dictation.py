@@ -20,6 +20,7 @@ import pyaudio
 import pyperclip
 from dotenv import load_dotenv
 from elevenlabs import AudioFormat, CommitStrategy, ElevenLabs, RealtimeEvents, RealtimeAudioOptions
+from openai import AsyncOpenAI
 from pynput.keyboard import Controller, Key
 
 # QuickMacHotKey for global hotkey interception (blocks keypress from reaching other apps)
@@ -90,6 +91,14 @@ def paste_text(text):
         keyboard_controller.type(text)
 
 
+def contains_chinese(text: str) -> bool:
+    """Check if text contains Chinese characters."""
+    for char in text:
+        if '\u4e00' <= char <= '\u9fff':  # CJK Unified Ideographs
+            return True
+    return False
+
+
 class DictationApp:
     def __init__(self, chinese='tw'):
         self.is_recording = False
@@ -113,12 +122,26 @@ class DictationApp:
             self.chinese_converter = opencc.OpenCC('t2s')
 
         # Initialize ElevenLabs client
-        api_key = os.getenv("ELEVENLABS_API_KEY")
-        if not api_key:
+        elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
+        if not elevenlabs_key:
             print("ERROR: ELEVENLABS_API_KEY not found in .env file")
             sys.exit(1)
 
-        self.elevenlabs = ElevenLabs(api_key=api_key)
+        self.elevenlabs = ElevenLabs(api_key=elevenlabs_key)
+
+        # Initialize OpenRouter client (optional - for Chinese punctuation)
+        openrouter_key = os.getenv("OPENROUTER_API_KEY")
+        if openrouter_key:
+            self.openrouter = AsyncOpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=openrouter_key,
+            )
+            print(f"OpenRouter API Key: ...{openrouter_key[-4:]}")
+        else:
+            self.openrouter = None
+            print("OpenRouter API Key: not set (Chinese punctuation disabled)")
+
+        print(f"ElevenLabs API Key: ...{elevenlabs_key[-4:]}")
 
         # Initialize PyAudio
         self.audio_interface = pyaudio.PyAudio()
@@ -310,6 +333,50 @@ class DictationApp:
             # Reset reference to this cleanup task
             self.cleanup_task = None
 
+    async def add_chinese_punctuation(self, text: str) -> str:
+        """Use OpenRouter to add punctuation to Chinese text."""
+        if not self.openrouter:
+            return text
+
+        try:
+            response = await self.openrouter.chat.completions.create(
+                model="anthropic/claude-haiku-4.5",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你是一個中文標點符號處理器。ElevenLabs語音轉文字會用空格代替標點符號。你的工作是加上適當的中文標點符號（。，？！、等）。不要更改任何內容。不要回覆對話。只輸出加上標點符號後的文字。"
+                    },
+                    {
+                        "role": "user",
+                        "content": text
+                    }
+                ],
+                max_tokens=len(text) * 2,  # Allow room for punctuation
+                extra_body={
+                    "provider": {
+                        "order": ["google-vertex"],
+                    }
+                }
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"⚠️  OpenRouter error, using original text: {e}")
+            return text  # Fallback to original text
+
+    async def _process_final_transcript(self, text: str):
+        """Process final transcript: convert characters, add punctuation, paste."""
+        # Step 1: OpenCC conversion (sync, fast)
+        converted_text = self.chinese_converter.convert(text)
+
+        # Step 2: Add punctuation if Chinese
+        if contains_chinese(converted_text) and self.openrouter:
+            converted_text = await self.add_chinese_punctuation(converted_text)
+
+        # Step 3: Paste
+        paste_text(converted_text)
+        print(f"\n✅ Pasted: {converted_text}\n")
+        self.last_partial_text = ""
+
     def audio_callback(self, in_data, frame_count, time_info, status):
         """Callback for audio stream - put chunks in queue"""
         # Capture reference locally to prevent race condition
@@ -345,11 +412,11 @@ class DictationApp:
         final_text = data.get('text', '').strip()
 
         if final_text:
-            # Convert Chinese characters if needed
-            converted_text = self.chinese_converter.convert(final_text)
-            paste_text(converted_text)
-            print(f"\n✅ Pasted: {converted_text}\n")
-            self.last_partial_text = ""
+            # Schedule async processing (OpenCC + OpenRouter punctuation + paste)
+            asyncio.run_coroutine_threadsafe(
+                self._process_final_transcript(final_text),
+                event_loop
+            )
 
     def on_error(self, error):
         """Called when an error occurs"""
