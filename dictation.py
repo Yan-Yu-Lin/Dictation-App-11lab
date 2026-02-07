@@ -284,7 +284,8 @@ class DictationApp:
         )
         self.cleanup_task: Optional[asyncio.Task] = None
         self.commit_events: dict[int, asyncio.Event] = {}
-        self.pasted_sessions: set[int] = set()
+        self.last_committed_text_by_session: dict[int, tuple[str, float]] = {}
+        self.paste_lock = asyncio.Lock()
 
         # Initialize Chinese character converter
         # s2t: Simplified to Traditional, t2s: Traditional to Simplified
@@ -632,9 +633,16 @@ class DictationApp:
                     await self._flush_remaining_audio(
                         connection, audio_queue, session_to_cleanup
                     )
+
+                    # Reset the event so we wait for the commit caused by this stop.
+                    # Without this, prior auto-commit events (e.g. 90s periodic commit)
+                    # can make wait() return immediately and drop the final chunk.
+                    commit_event = self.commit_events.get(session_to_cleanup)
+                    if commit_event:
+                        commit_event.clear()
+
                     await connection.commit()
 
-                    commit_event = self.commit_events.get(session_to_cleanup)
                     if commit_event:
                         try:
                             await asyncio.wait_for(
@@ -655,7 +663,7 @@ class DictationApp:
             print(f"⚠️  Error during cleanup: {e}")
         finally:
             self.commit_events.pop(session_to_cleanup, None)
-            self.pasted_sessions.discard(session_to_cleanup)
+            self.last_committed_text_by_session.pop(session_to_cleanup, None)
             hide_overlay()
             # Clear active session only if this cleanup belongs to the active one
             if self.active_session_id == session_to_cleanup:
@@ -665,20 +673,21 @@ class DictationApp:
 
     async def _process_final_transcript(self, text: str, session_id: int):
         """Process final transcript: convert characters, add punctuation, paste."""
-        # Step 1: OpenCC conversion (sync, fast)
-        converted_text = self.chinese_converter.convert(text)
+        async with self.paste_lock:
+            # Step 1: OpenCC conversion (sync, fast)
+            converted_text = self.chinese_converter.convert(text)
 
-        # Step 2: Add punctuation if Chinese (run in executor to keep event loop responsive)
-        if contains_chinese(converted_text):
-            loop = asyncio.get_running_loop()
-            converted_text = await loop.run_in_executor(
-                None, self.add_local_chinese_punctuation, converted_text
-            )
+            # Step 2: Add punctuation if Chinese (run in executor to keep event loop responsive)
+            if contains_chinese(converted_text):
+                loop = asyncio.get_running_loop()
+                converted_text = await loop.run_in_executor(
+                    None, self.add_local_chinese_punctuation, converted_text
+                )
 
-        # Step 3: Paste
-        paste_text(converted_text)
-        print(f"\n✅ Pasted: {converted_text}\n")
-        self.last_partial_text = ""
+            # Step 3: Paste
+            paste_text(converted_text)
+            print(f"\n✅ Pasted: {converted_text}\n")
+            self.last_partial_text = ""
 
     def audio_callback(self, in_data, frame_count, time_info, status):
         """Callback for audio stream - put chunks in queue"""
@@ -728,13 +737,21 @@ class DictationApp:
         if session_id not in self.commit_events:
             return
 
-        if session_id in self.pasted_sessions:
+        final_text = data.get("text", "").strip()
+        if not final_text:
             return
 
-        final_text = data.get("text", "").strip()
+        # Deduplicate rapid repeated committed events for the same segment.
+        # Keep only near-identical repeats, allow same text later in long sessions.
+        now = time.monotonic()
+        last_committed = self.last_committed_text_by_session.get(session_id)
+        if last_committed:
+            last_text, last_time = last_committed
+            if last_text == final_text and (now - last_time) < 1.5:
+                return
+        self.last_committed_text_by_session[session_id] = (final_text, now)
 
-        if final_text and event_loop:
-            self.pasted_sessions.add(session_id)
+        if event_loop:
             # Schedule async processing (OpenCC + local Chinese punctuation + paste)
             asyncio.run_coroutine_threadsafe(
                 self._process_final_transcript(final_text, session_id), event_loop
