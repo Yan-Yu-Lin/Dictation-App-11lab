@@ -26,7 +26,7 @@ from elevenlabs import (
     RealtimeEvents,
     RealtimeAudioOptions,
 )
-from openai import AsyncOpenAI
+from funasr import AutoModel
 from pynput.keyboard import Controller, Key
 
 # QuickMacHotKey for global hotkey interception (blocks keypress from reaching other apps)
@@ -51,6 +51,7 @@ CHANNELS = 1  # Mono
 MAX_AUDIO_QUEUE_CHUNKS = 120  # ~30s of buffered audio at CHUNK_SIZE=4096
 CONNECT_TIMEOUT_SECONDS = 8.0
 FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
+LOCAL_PUNC_MODEL_ID = "ct-punc"
 
 # Sound effects (macOS system sounds)
 SOUND_START = "/System/Library/Sounds/Hero.aiff"  # Sound when recording starts
@@ -122,6 +123,7 @@ class DictationApp:
         )
         self.cleanup_task: Optional[asyncio.Task] = None
         self.commit_events: dict[int, asyncio.Event] = {}
+        self.pasted_sessions: set[int] = set()
 
         # Initialize Chinese character converter
         # s2t: Simplified to Traditional, t2s: Traditional to Simplified
@@ -139,17 +141,8 @@ class DictationApp:
 
         self.elevenlabs = ElevenLabs(api_key=elevenlabs_key)
 
-        # Initialize OpenRouter client (optional - for Chinese punctuation)
-        openrouter_key = os.getenv("OPENROUTER_API_KEY")
-        if openrouter_key:
-            self.openrouter = AsyncOpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=openrouter_key,
-            )
-            print(f"OpenRouter API Key: ...{openrouter_key[-4:]}")
-        else:
-            self.openrouter = None
-            print("OpenRouter API Key: not set (Chinese punctuation disabled)")
+        # Initialize local punctuation model at startup (blocking by design)
+        self.local_punc_model = self._load_local_punctuation_model()
 
         print(f"ElevenLabs API Key: ...{elevenlabs_key[-4:]}")
 
@@ -162,6 +155,58 @@ class DictationApp:
         )
         print(f"Press Cmd+Option+Control+{TRIGGER_KEY.upper()} to start/stop recording")
         print("(Or press your Hyper Key + D if you have it configured)\n")
+
+    def _load_local_punctuation_model(self):
+        """Load local punctuation model once so it is ready for every Chinese transcript."""
+        try:
+            print(
+                f"Loading local punctuation model '{LOCAL_PUNC_MODEL_ID}'... "
+                "(first run may download model files)"
+            )
+            model = AutoModel(
+                model=LOCAL_PUNC_MODEL_ID,
+                trust_remote_code=False,
+                disable_update=True,
+                device="cpu",
+            )
+            print("✅ Local punctuation model loaded")
+            return model
+        except Exception as e:
+            print(
+                f"ERROR: Failed to load local punctuation model '{LOCAL_PUNC_MODEL_ID}': {e}"
+            )
+            sys.exit(1)
+
+    @staticmethod
+    def _extract_punctuation_output(result, fallback_text: str) -> str:
+        """Extract punctuated text from FunASR output payload."""
+        if isinstance(result, list) and result:
+            first = result[0]
+            if isinstance(first, dict):
+                text = first.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+
+        return fallback_text
+
+    def add_local_chinese_punctuation(self, text: str) -> str:
+        """Use local CT-Punc model to add punctuation."""
+        if not text.strip():
+            return text
+
+        started = time.perf_counter()
+        try:
+            result = self.local_punc_model.generate(input=text, disable_pbar=True)
+            punctuated = self._extract_punctuation_output(result, text)
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            print(f"✍️  Local Chinese punctuation added ({elapsed_ms}ms)")
+            return punctuated
+        except Exception as e:
+            print(f"⚠️  Local punctuation error, using original text: {e}")
+            return text
 
     async def start_recording(self):
         """Start recording audio and connect to ElevenLabs"""
@@ -444,54 +489,24 @@ class DictationApp:
             print(f"⚠️  Error during cleanup: {e}")
         finally:
             self.commit_events.pop(session_to_cleanup, None)
+            self.pasted_sessions.discard(session_to_cleanup)
             # Clear active session only if this cleanup belongs to the active one
             if self.active_session_id == session_to_cleanup:
                 self.active_session_id = None
             # Reset reference to this cleanup task
             self.cleanup_task = None
 
-    async def add_chinese_punctuation(self, text: str) -> str:
-        """Use OpenRouter to add punctuation to Chinese text."""
-        if not self.openrouter:
-            return text
-
-        try:
-            response = await self.openrouter.chat.completions.create(
-                model="anthropic/claude-haiku-4.5",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "你是一個中文標點符號處理器。ElevenLabs語音轉文字會用空格代替標點符號。你的工作是加上適當的中文標點符號（。，？！、等）。不要更改任何內容。不要回覆對話。只輸出加上標點符號後的文字。",
-                    },
-                    {"role": "user", "content": text},
-                ],
-                max_tokens=len(text) * 2,  # Allow room for punctuation
-                extra_body={
-                    "provider": {
-                        "order": ["google-vertex"],
-                    }
-                },
-            )
-            content = response.choices[0].message.content
-            if not content:
-                return text
-            return content.strip()
-        except Exception as e:
-            print(f"⚠️  OpenRouter error, using original text: {e}")
-            return text  # Fallback to original text
-
     async def _process_final_transcript(self, text: str, session_id: int):
         """Process final transcript: convert characters, add punctuation, paste."""
         # Step 1: OpenCC conversion (sync, fast)
         converted_text = self.chinese_converter.convert(text)
 
-        # Step 2: Add punctuation if Chinese
-        if contains_chinese(converted_text) and self.openrouter:
-            converted_text = await self.add_chinese_punctuation(converted_text)
-
-        # Ignore stale transcripts from older sessions
-        if session_id != self.active_session_id:
-            return
+        # Step 2: Add punctuation if Chinese (run in executor to keep event loop responsive)
+        if contains_chinese(converted_text):
+            loop = asyncio.get_running_loop()
+            converted_text = await loop.run_in_executor(
+                None, self.add_local_chinese_punctuation, converted_text
+            )
 
         # Step 3: Paste
         paste_text(converted_text)
@@ -543,13 +558,17 @@ class DictationApp:
         if commit_event and event_loop:
             event_loop.call_soon_threadsafe(commit_event.set)
 
-        if session_id != self.active_session_id:
+        if session_id not in self.commit_events:
+            return
+
+        if session_id in self.pasted_sessions:
             return
 
         final_text = data.get("text", "").strip()
 
         if final_text and event_loop:
-            # Schedule async processing (OpenCC + OpenRouter punctuation + paste)
+            self.pasted_sessions.add(session_id)
+            # Schedule async processing (OpenCC + local Chinese punctuation + paste)
             asyncio.run_coroutine_threadsafe(
                 self._process_final_transcript(final_text, session_id), event_loop
             )
