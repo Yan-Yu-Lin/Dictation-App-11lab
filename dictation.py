@@ -12,14 +12,20 @@ import sys
 import subprocess
 import threading
 import time
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 from typing import Optional
 
 import opencc
 import pyaudio
 import pyperclip
 from dotenv import load_dotenv
-from elevenlabs import AudioFormat, CommitStrategy, ElevenLabs, RealtimeEvents, RealtimeAudioOptions
+from elevenlabs import (
+    AudioFormat,
+    CommitStrategy,
+    ElevenLabs,
+    RealtimeEvents,
+    RealtimeAudioOptions,
+)
 from openai import AsyncOpenAI
 from pynput.keyboard import Controller, Key
 
@@ -37,11 +43,14 @@ load_dotenv()
 
 # Configuration
 # Using Cmd+Option+Control+D (hyper key + D)
-TRIGGER_KEY = 'd'  # The key to press with hyper key
+TRIGGER_KEY = "d"  # The key to press with hyper key
 SAMPLE_RATE = 16000  # 16kHz recommended by ElevenLabs
 CHUNK_SIZE = 4096  # Audio chunk size (0.25 seconds at 16kHz)
 AUDIO_FORMAT = pyaudio.paInt16  # 16-bit PCM
 CHANNELS = 1  # Mono
+MAX_AUDIO_QUEUE_CHUNKS = 120  # ~30s of buffered audio at CHUNK_SIZE=4096
+CONNECT_TIMEOUT_SECONDS = 8.0
+FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
 
 # Sound effects (macOS system sounds)
 SOUND_START = "/System/Library/Sounds/Hero.aiff"  # Sound when recording starts
@@ -56,9 +65,7 @@ def play_sound(sound_path):
     """Play a system sound asynchronously (non-blocking)"""
     try:
         subprocess.Popen(
-            ["afplay", sound_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            ["afplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     except Exception:
         pass  # Silently fail if sound can't be played
@@ -76,8 +83,8 @@ def paste_text(text):
         # Simulate Cmd+V to paste
         keyboard_controller = Controller()
         keyboard_controller.press(Key.cmd)
-        keyboard_controller.press('v')
-        keyboard_controller.release('v')
+        keyboard_controller.press("v")
+        keyboard_controller.release("v")
         keyboard_controller.release(Key.cmd)
 
         # Delay before restoring clipboard (gives time for paste and clipboard managers)
@@ -94,13 +101,13 @@ def paste_text(text):
 def contains_chinese(text: str) -> bool:
     """Check if text contains Chinese characters."""
     for char in text:
-        if '\u4e00' <= char <= '\u9fff':  # CJK Unified Ideographs
+        if "\u4e00" <= char <= "\u9fff":  # CJK Unified Ideographs
             return True
     return False
 
 
 class DictationApp:
-    def __init__(self, chinese='tw'):
+    def __init__(self, chinese="tw"):
         self.is_recording = False
         self.audio_stream = None
         self.audio_interface = None
@@ -110,16 +117,19 @@ class DictationApp:
         self.session_id = 0  # Track session number to handle parallel cleanup
         self.current_sender_task = None  # Track the current send_audio_chunks task
         self.session_lock = asyncio.Lock()  # Serialize start/stop
-        self.active_session_id: Optional[int] = None  # Identify which session events belong to
+        self.active_session_id: Optional[int] = (
+            None  # Identify which session events belong to
+        )
         self.cleanup_task: Optional[asyncio.Task] = None
+        self.commit_events: dict[int, asyncio.Event] = {}
 
         # Initialize Chinese character converter
         # s2t: Simplified to Traditional, t2s: Traditional to Simplified
         self.chinese_variant = chinese
-        if chinese == 'tw':
-            self.chinese_converter = opencc.OpenCC('s2t')
+        if chinese == "tw":
+            self.chinese_converter = opencc.OpenCC("s2t")
         else:
-            self.chinese_converter = opencc.OpenCC('t2s')
+            self.chinese_converter = opencc.OpenCC("t2s")
 
         # Initialize ElevenLabs client
         elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
@@ -147,7 +157,9 @@ class DictationApp:
         self.audio_interface = pyaudio.PyAudio()
 
         print("Dictation App Ready!")
-        print(f"Chinese output: {'Traditional (TW)' if chinese == 'tw' else 'Simplified (CN)'}")
+        print(
+            f"Chinese output: {'Traditional (TW)' if chinese == 'tw' else 'Simplified (CN)'}"
+        )
         print(f"Press Cmd+Option+Control+{TRIGGER_KEY.upper()} to start/stop recording")
         print("(Or press your Hyper Key + D if you have it configured)\n")
 
@@ -164,25 +176,61 @@ class DictationApp:
             self.session_id += 1
             current_session = self.session_id
             self.active_session_id = current_session
+            self.commit_events[current_session] = asyncio.Event()
 
             # Create a NEW queue for this session (isolates from previous sessions)
-            self.audio_queue = Queue()
+            self.audio_queue = Queue(maxsize=MAX_AUDIO_QUEUE_CHUNKS)
 
-            # Play start sound
+        # Start audio stream first to avoid dropping the beginning while websocket connects
+        try:
+            if not self.audio_interface:
+                raise RuntimeError("Audio interface is not initialized")
+
+            self.audio_stream = self.audio_interface.open(
+                format=AUDIO_FORMAT,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=CHUNK_SIZE,
+                stream_callback=self.audio_callback,
+            )
+            self.audio_stream.start_stream()
+
+            # Only play start sound after mic is actually active
             play_sound(SOUND_START)
+            print("\n🎙️  Recording started. Listening now...")
+            print("🔄 Connecting to ElevenLabs realtime...")
 
-            print("\n🎙️  Recording started... Speak now!")
+        except Exception as e:
+            print(f"❌ Error starting audio stream: {e}")
+            async with self.session_lock:
+                if self.active_session_id == current_session:
+                    self.is_recording = False
+                    self.active_session_id = None
+                    self.audio_stream = None
+                    self.audio_queue = None
+                self.commit_events.pop(current_session, None)
+            return
 
         # Connect to ElevenLabs Realtime API (outside lock to keep hotkey responsive)
         try:
-            new_connection = await self.elevenlabs.speech_to_text.realtime.connect(
-                RealtimeAudioOptions(
-                    model_id="scribe_v2_realtime",
-                    audio_format=AudioFormat.PCM_16000,
-                    sample_rate=SAMPLE_RATE,
-                    commit_strategy=CommitStrategy.MANUAL,
-                    include_timestamps=False,
+            realtime_client = getattr(self.elevenlabs.speech_to_text, "realtime", None)
+            if realtime_client is None:
+                raise RuntimeError(
+                    "Realtime client unavailable in current ElevenLabs SDK"
                 )
+
+            new_connection = await asyncio.wait_for(
+                realtime_client.connect(
+                    RealtimeAudioOptions(
+                        model_id="scribe_v2_realtime",
+                        audio_format=AudioFormat.PCM_16000,
+                        sample_rate=SAMPLE_RATE,
+                        commit_strategy=CommitStrategy.MANUAL,
+                        include_timestamps=False,
+                    )
+                ),
+                timeout=CONNECT_TIMEOUT_SECONDS,
             )
 
             # If a stop happened during connect, drop this connection
@@ -190,12 +238,28 @@ class DictationApp:
                 await new_connection.close()
                 return
 
-            # Set up event handlers
-            new_connection.on(RealtimeEvents.SESSION_STARTED, self.on_session_started)
-            new_connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, self.on_partial_transcript)
-            new_connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, self.on_committed_transcript)
-            new_connection.on(RealtimeEvents.ERROR, self.on_error)
-            new_connection.on(RealtimeEvents.CLOSE, self.on_close)
+            # Set up session-scoped event handlers to prevent stale callbacks crossing sessions
+            new_connection.on(
+                RealtimeEvents.SESSION_STARTED,
+                lambda data, sid=current_session: self.on_session_started(data, sid),
+            )
+            new_connection.on(
+                RealtimeEvents.PARTIAL_TRANSCRIPT,
+                lambda data, sid=current_session: self.on_partial_transcript(data, sid),
+            )
+            new_connection.on(
+                RealtimeEvents.COMMITTED_TRANSCRIPT,
+                lambda data, sid=current_session: self.on_committed_transcript(
+                    data, sid
+                ),
+            )
+            new_connection.on(
+                RealtimeEvents.ERROR,
+                lambda error, sid=current_session: self.on_error(error, sid),
+            )
+            new_connection.on(
+                RealtimeEvents.CLOSE, lambda *_, sid=current_session: self.on_close(sid)
+            )
 
             # Only assign to self.connection after successfully creating it
             # Verify session is still current (protect against stale starts)
@@ -205,58 +269,66 @@ class DictationApp:
 
             self.connection = new_connection
 
+            # Start sender only after websocket is ready.
+            # Audio captured before this point stays buffered in self.audio_queue.
+            self.current_sender_task = asyncio.create_task(
+                self.send_audio_chunks(
+                    new_connection, self.audio_queue, current_session
+                )
+            )
+
+        except asyncio.TimeoutError:
+            print(
+                f"❌ Timed out connecting to ElevenLabs after {CONNECT_TIMEOUT_SECONDS:.1f}s"
+            )
+            if self.audio_stream:
+                self.audio_stream.stop_stream()
+                self.audio_stream.close()
+            self.audio_stream = None
+            self.audio_queue = None
+            self.current_sender_task = None
+            self.connection = None
+            if self.active_session_id == current_session:
+                self.is_recording = False
+                self.active_session_id = None
+            self.commit_events.pop(current_session, None)
+            return
         except Exception as e:
             print(f"❌ Error connecting to ElevenLabs: {e}")
-            self.is_recording = False
-            self.active_session_id = None
-            return
+            if self.audio_stream:
+                self.audio_stream.stop_stream()
+                self.audio_stream.close()
+            self.audio_stream = None
+            self.audio_queue = None
+            self.current_sender_task = None
+            self.connection = None
+            if self.active_session_id == current_session:
+                self.is_recording = False
+                self.active_session_id = None
+            self.commit_events.pop(current_session, None)
 
-        # Start audio stream (outside the lock)
-        try:
-            self.audio_stream = self.audio_interface.open(
-                format=AUDIO_FORMAT,
-                channels=CHANNELS,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE,
-                stream_callback=self.audio_callback
-            )
-            self.audio_stream.start_stream()
-
-            # Start the audio sender task and keep reference
-            self.current_sender_task = asyncio.create_task(self.send_audio_chunks())
-
-        except Exception as e:
-            print(f"❌ Error starting audio stream: {e}")
-            if self.connection:
-                await self.connection.close()
-            self.is_recording = False
-            self.active_session_id = None
-
-    async def send_audio_chunks(self):
-        """Send audio chunks from the queue to ElevenLabs"""
+    async def send_audio_chunks(self, connection, audio_queue: Queue, session_id: int):
+        """Send audio chunks from the queue to ElevenLabs for one session."""
         try:
             while self.is_recording:
                 try:
                     # Get audio chunk from queue (non-blocking with timeout)
                     try:
-                        audio_data = self.audio_queue.get(timeout=0.01)
+                        audio_data = audio_queue.get(timeout=0.01)
                     except Empty:
                         await asyncio.sleep(0.01)
                         continue
 
                     # Convert audio to base64
-                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                    audio_base64 = base64.b64encode(audio_data).decode("utf-8")
 
                     # Send to ElevenLabs
-                    if self.connection:
-                        await self.connection.send({
-                            "audio_base_64": audio_base64,
-                            "sample_rate": SAMPLE_RATE
-                        })
+                    await connection.send(
+                        {"audio_base_64": audio_base64, "sample_rate": SAMPLE_RATE}
+                    )
 
                 except Exception as e:
-                    print(f"⚠️  Error sending audio: {e}")
+                    print(f"⚠️  Error sending audio (session {session_id}): {e}")
                     await asyncio.sleep(0.01)
 
         except asyncio.CancelledError:
@@ -269,7 +341,7 @@ class DictationApp:
             if not self.is_recording:
                 return
 
-            current_session = self.active_session_id
+            current_session = self.active_session_id or self.session_id
 
             # Immediately stop recording to allow new session to start
             self.is_recording = False
@@ -279,7 +351,7 @@ class DictationApp:
 
             print("\n🛑 Recording stopped. Finalizing transcription...")
 
-            # CRITICAL: Cancel the sender task immediately to stop processing
+            # Cancel sender task; any remaining buffered chunks are flushed in cleanup
             if self.current_sender_task and not self.current_sender_task.done():
                 self.current_sender_task.cancel()
                 try:
@@ -293,8 +365,8 @@ class DictationApp:
                 self.audio_stream.close()
 
             # Capture references to current session's resources
-            old_audio_stream = self.audio_stream  # Already stopped, but keep for cleanup
             old_connection = self.connection
+            old_audio_queue = self.audio_queue
 
             # Clear references immediately so new session can start
             self.audio_stream = None
@@ -304,21 +376,65 @@ class DictationApp:
 
             # Clean up old session asynchronously in background and remember task
             self.cleanup_task = asyncio.create_task(
-                self._cleanup_session(old_audio_stream, old_connection, current_session)
+                self._cleanup_session(old_connection, old_audio_queue, current_session)
             )
 
-    async def _cleanup_session(self, audio_stream, connection, session_to_cleanup: Optional[int]):
+    async def _flush_remaining_audio(
+        self,
+        connection,
+        audio_queue: Optional[Queue],
+        session_to_cleanup: int,
+    ):
+        """Flush any buffered chunks that were captured before stop."""
+        if not connection or not audio_queue:
+            return
+
+        flushed = 0
+        while True:
+            try:
+                audio_data = audio_queue.get_nowait()
+            except Empty:
+                break
+
+            audio_base64 = base64.b64encode(audio_data).decode("utf-8")
+            await connection.send(
+                {"audio_base_64": audio_base64, "sample_rate": SAMPLE_RATE}
+            )
+            flushed += 1
+
+        if flushed > 0:
+            print(
+                f"📤 Flushed {flushed} buffered chunks (session {session_to_cleanup})"
+            )
+
+    async def _cleanup_session(
+        self,
+        connection,
+        audio_queue: Optional[Queue],
+        session_to_cleanup: int,
+    ):
         """Clean up a session's resources in the background"""
         try:
-            # Audio stream is already stopped and sender task is already cancelled in stop_recording()
-            # No need to wait - proceed directly to commit
-
             # Commit and close connection
             if connection:
                 try:
+                    await self._flush_remaining_audio(
+                        connection, audio_queue, session_to_cleanup
+                    )
                     await connection.commit()
-                    # Give it a moment to receive the committed transcript
-                    await asyncio.sleep(1.0)
+
+                    commit_event = self.commit_events.get(session_to_cleanup)
+                    if commit_event:
+                        try:
+                            await asyncio.wait_for(
+                                commit_event.wait(),
+                                timeout=FINAL_TRANSCRIPT_TIMEOUT_SECONDS,
+                            )
+                        except asyncio.TimeoutError:
+                            print(
+                                "⚠️  Final transcript event timed out; closing session"
+                            )
+
                     await connection.close()
                 except Exception as e:
                     print(f"⚠️  Error closing connection: {e}")
@@ -327,6 +443,7 @@ class DictationApp:
         except Exception as e:
             print(f"⚠️  Error during cleanup: {e}")
         finally:
+            self.commit_events.pop(session_to_cleanup, None)
             # Clear active session only if this cleanup belongs to the active one
             if self.active_session_id == session_to_cleanup:
                 self.active_session_id = None
@@ -344,26 +461,26 @@ class DictationApp:
                 messages=[
                     {
                         "role": "system",
-                        "content": "你是一個中文標點符號處理器。ElevenLabs語音轉文字會用空格代替標點符號。你的工作是加上適當的中文標點符號（。，？！、等）。不要更改任何內容。不要回覆對話。只輸出加上標點符號後的文字。"
+                        "content": "你是一個中文標點符號處理器。ElevenLabs語音轉文字會用空格代替標點符號。你的工作是加上適當的中文標點符號（。，？！、等）。不要更改任何內容。不要回覆對話。只輸出加上標點符號後的文字。",
                     },
-                    {
-                        "role": "user",
-                        "content": text
-                    }
+                    {"role": "user", "content": text},
                 ],
                 max_tokens=len(text) * 2,  # Allow room for punctuation
                 extra_body={
                     "provider": {
                         "order": ["google-vertex"],
                     }
-                }
+                },
             )
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            if not content:
+                return text
+            return content.strip()
         except Exception as e:
             print(f"⚠️  OpenRouter error, using original text: {e}")
             return text  # Fallback to original text
 
-    async def _process_final_transcript(self, text: str):
+    async def _process_final_transcript(self, text: str, session_id: int):
         """Process final transcript: convert characters, add punctuation, paste."""
         # Step 1: OpenCC conversion (sync, fast)
         converted_text = self.chinese_converter.convert(text)
@@ -371,6 +488,10 @@ class DictationApp:
         # Step 2: Add punctuation if Chinese
         if contains_chinese(converted_text) and self.openrouter:
             converted_text = await self.add_chinese_punctuation(converted_text)
+
+        # Ignore stale transcripts from older sessions
+        if session_id != self.active_session_id:
+            return
 
         # Step 3: Paste
         paste_text(converted_text)
@@ -382,21 +503,32 @@ class DictationApp:
         # Capture reference locally to prevent race condition
         queue = self.audio_queue
         if self.is_recording and queue is not None:
-            queue.put(in_data)
+            try:
+                queue.put_nowait(in_data)
+            except Full:
+                # Keep newest audio if buffer is full
+                try:
+                    queue.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    queue.put_nowait(in_data)
+                except Full:
+                    pass
 
         return (in_data, pyaudio.paContinue)
 
-    def on_session_started(self, data):
+    def on_session_started(self, data, session_id):
         """Called when WebSocket session starts"""
-        if self.active_session_id is None:
+        if session_id != self.active_session_id:
             return
         print("🔌 Connected to ElevenLabs Scribe v2 Realtime")
 
-    def on_partial_transcript(self, data):
+    def on_partial_transcript(self, data, session_id):
         """Called when partial transcript is received"""
-        if self.active_session_id is None:
+        if session_id != self.active_session_id:
             return
-        new_text = data.get('text', '').strip()
+        new_text = data.get("text", "").strip()
 
         if not new_text:
             return
@@ -405,28 +537,32 @@ class DictationApp:
         self.last_partial_text = new_text
         print(f"📝 Processing: {new_text}")
 
-    def on_committed_transcript(self, data):
+    def on_committed_transcript(self, data, session_id):
         """Called when final transcript is committed"""
-        if self.active_session_id is None:
-            return
-        final_text = data.get('text', '').strip()
+        commit_event = self.commit_events.get(session_id)
+        if commit_event and event_loop:
+            event_loop.call_soon_threadsafe(commit_event.set)
 
-        if final_text:
+        if session_id != self.active_session_id:
+            return
+
+        final_text = data.get("text", "").strip()
+
+        if final_text and event_loop:
             # Schedule async processing (OpenCC + OpenRouter punctuation + paste)
             asyncio.run_coroutine_threadsafe(
-                self._process_final_transcript(final_text),
-                event_loop
+                self._process_final_transcript(final_text, session_id), event_loop
             )
 
-    def on_error(self, error):
+    def on_error(self, error, session_id):
         """Called when an error occurs"""
-        if self.active_session_id is None:
+        if session_id != self.active_session_id:
             return
         print(f"❌ Error: {error}")
 
-    def on_close(self):
+    def on_close(self, session_id):
         """Called when connection closes"""
-        if self.active_session_id is None:
+        if session_id != self.active_session_id:
             return
         print("🔌 Connection closed")
 
@@ -445,10 +581,7 @@ app = None
 
 # Global hotkey handler using QuickMacHotKey
 # This automatically intercepts and blocks the hotkey from reaching other apps (like terminal)
-@quickHotKey(
-    virtualKey=kVK_ANSI_D,
-    modifierMask=mask(cmdKey, controlKey, optionKey)
-)
+@quickHotKey(virtualKey=kVK_ANSI_D, modifierMask=mask(cmdKey, controlKey, optionKey))
 def handle_hotkey():
     """
     Handle the global hotkey Cmd+Option+Control+D.
@@ -492,10 +625,12 @@ def setup_async_loop(chinese):
     loop.run_forever()
 
 
-def start_app(chinese='tw'):
+def start_app(chinese="tw"):
     """Start the application with NSApplication event loop."""
     # Start asyncio event loop in a separate thread
-    async_thread = threading.Thread(target=setup_async_loop, args=(chinese,), daemon=True)
+    async_thread = threading.Thread(
+        target=setup_async_loop, args=(chinese,), daemon=True
+    )
     async_thread.start()
 
     # Wait for the async thread to initialize
@@ -524,13 +659,13 @@ def start_app(chinese='tw'):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Dictation app using ElevenLabs Scribe v2 Realtime'
+        description="Dictation app using ElevenLabs Scribe v2 Realtime"
     )
     parser.add_argument(
-        '--chinese',
-        choices=['tw', 'cn'],
-        default='tw',
-        help='Chinese character variant: tw (Traditional, default) or cn (Simplified)'
+        "--chinese",
+        choices=["tw", "cn"],
+        default="tw",
+        help="Chinese character variant: tw (Traditional, default) or cn (Simplified)",
     )
     args = parser.parse_args()
     start_app(chinese=args.chinese)
