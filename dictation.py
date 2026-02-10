@@ -12,6 +12,7 @@ import sys
 import subprocess
 import threading
 import time
+import unicodedata
 from queue import Queue, Empty, Full
 from typing import Optional
 
@@ -75,6 +76,7 @@ MAX_AUDIO_QUEUE_CHUNKS = 120  # ~30s of buffered audio at CHUNK_SIZE=4096
 CONNECT_TIMEOUT_SECONDS = 8.0
 FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
 LOCAL_PUNC_MODEL_ID = "ct-punc"
+TRANSCRIPT_DEBUG_LOG = os.getenv("DICTATION_TRANSCRIPT_DEBUG", "1") != "0"
 
 # Sound effects (macOS system sounds)
 SOUND_START = "/System/Library/Sounds/Pop.aiff"  # Sound when recording starts
@@ -117,6 +119,22 @@ def hide_overlay():
     global status_overlay
     if status_overlay:
         AppHelper.callAfter(status_overlay.hide)
+
+
+def _log_preview_text(text: str, limit: int = 220) -> str:
+    """Build a single-line preview for transcript debug logs."""
+    safe = text.replace("\n", "\\n")
+    if len(safe) <= limit:
+        return safe
+    return safe[: limit - 3] + "..."
+
+
+def log_transcript_stage(session_id: int, stage: str, text: str):
+    """Print transcript text after each processing stage for debugging."""
+    if not TRANSCRIPT_DEBUG_LOG:
+        return
+    preview = _log_preview_text(text)
+    print(f"📊 [session {session_id}] {stage} (len={len(text)}): {preview}")
 
 
 class StatusOverlay(NSObject):
@@ -260,12 +278,163 @@ def paste_text(text):
         keyboard_controller.type(text)
 
 
+def is_chinese_char(char: str) -> bool:
+    """Check if a character is a CJK ideograph."""
+    code = ord(char)
+    return (
+        0x4E00 <= code <= 0x9FFF  # CJK Unified Ideographs
+        or 0x3400 <= code <= 0x4DBF  # CJK Unified Ideographs Extension A
+    )
+
+
 def contains_chinese(text: str) -> bool:
     """Check if text contains Chinese characters."""
     for char in text:
-        if "\u4e00" <= char <= "\u9fff":  # CJK Unified Ideographs
+        if is_chinese_char(char):
             return True
     return False
+
+
+def contains_latin_letters(text: str) -> bool:
+    """Check if text contains basic Latin letters (A-Z/a-z)."""
+    for char in text:
+        if is_latin_letter(char):
+            return True
+    return False
+
+
+def is_latin_letter(char: str) -> bool:
+    """Check if a character is a basic Latin letter."""
+    return ("a" <= char <= "z") or ("A" <= char <= "Z")
+
+
+def is_punctuation(char: str) -> bool:
+    """Check if a character is punctuation."""
+    return unicodedata.category(char).startswith("P")
+
+
+def normalize_for_chinese_punctuation(text: str) -> str:
+    """Clean only Chinese-adjacent spaces/punctuation before punctuation pass.
+
+    This keeps English spacing intact for mixed-language dictation while still
+    removing noisy separators around Chinese text.
+    """
+    chars = list(text)
+    normalized_chars = []
+
+    for i, char in enumerate(chars):
+        prev_is_zh = i > 0 and is_chinese_char(chars[i - 1])
+        next_is_zh = i + 1 < len(chars) and is_chinese_char(chars[i + 1])
+        near_zh = prev_is_zh or next_is_zh
+        prev_is_latin = i > 0 and (
+            ("a" <= chars[i - 1] <= "z") or ("A" <= chars[i - 1] <= "Z")
+        )
+        next_is_latin = i + 1 < len(chars) and (
+            ("a" <= chars[i + 1] <= "z") or ("A" <= chars[i + 1] <= "Z")
+        )
+
+        # Remove spaces only inside Chinese segments, keep boundary spaces between
+        # Chinese and English words for readability.
+        if char.isspace():
+            if prev_is_zh and next_is_zh:
+                continue
+            if prev_is_zh and not next_is_latin:
+                continue
+            if next_is_zh and not prev_is_latin:
+                continue
+
+        if is_punctuation(char) and near_zh:
+            continue
+
+        normalized_chars.append(char)
+
+    return "".join(normalized_chars)
+
+
+def split_text_for_mixed_punctuation(text: str) -> list[tuple[bool, str]]:
+    """Split text into chunks for mixed Chinese/English punctuation processing.
+
+    Returns a list of (is_chinese_chunk, chunk_text), preserving original order.
+    Chinese chunks include Chinese chars and nearby separators.
+    """
+    if not text:
+        return []
+
+    chars = list(text)
+
+    def chunk_is_chinese(i: int) -> bool:
+        char = chars[i]
+        if is_chinese_char(char):
+            return True
+
+        if not (char.isspace() or is_punctuation(char)):
+            return False
+
+        prev_is_zh = i > 0 and is_chinese_char(chars[i - 1])
+        next_is_zh = i + 1 < len(chars) and is_chinese_char(chars[i + 1])
+        prev_is_latin = i > 0 and is_latin_letter(chars[i - 1])
+        next_is_latin = i + 1 < len(chars) and is_latin_letter(chars[i + 1])
+
+        # Keep separators with Chinese, unless clearly between Latin words.
+        return (prev_is_zh or next_is_zh) and not (prev_is_latin and next_is_latin)
+
+    chunks: list[tuple[bool, str]] = []
+    current_is_zh = chunk_is_chinese(0)
+    current_chars = [chars[0]]
+
+    for i in range(1, len(chars)):
+        is_zh = chunk_is_chinese(i)
+        if is_zh == current_is_zh:
+            current_chars.append(chars[i])
+            continue
+
+        chunks.append((current_is_zh, "".join(current_chars)))
+        current_is_zh = is_zh
+        current_chars = [chars[i]]
+
+    chunks.append((current_is_zh, "".join(current_chars)))
+    return chunks
+
+
+def strip_terminal_sentence_punctuation(text: str) -> str:
+    """Remove terminal sentence punctuation from a chunk."""
+    trimmed = text.rstrip()
+    while trimmed and trimmed[-1] in "。！？.!?":
+        trimmed = trimmed[:-1].rstrip()
+    return trimmed
+
+
+def merge_mixed_chunks(chunks: list[str]) -> str:
+    """Merge processed chunks and preserve readable boundaries."""
+    merged = ""
+
+    for chunk in chunks:
+        if not chunk:
+            continue
+
+        if not merged:
+            merged = chunk
+            continue
+
+        prev = merged[-1]
+        curr = chunk[0]
+        needs_space = (
+            (is_chinese_char(prev) and is_latin_letter(curr))
+            or (is_latin_letter(prev) and is_chinese_char(curr))
+            or (prev in "。！？.!?" and is_latin_letter(curr))
+        )
+
+        if (
+            needs_space
+            and not prev.isspace()
+            and not curr.isspace()
+            and not is_punctuation(curr)
+        ):
+            merged += " "
+
+        merged += chunk
+
+    return merged
 
 
 class DictationApp:
@@ -369,6 +538,50 @@ class DictationApp:
         except Exception as e:
             print(f"⚠️  Local punctuation error, using original text: {e}")
             return text
+
+    def add_local_chinese_punctuation_mixed(self, text: str, session_id: int) -> str:
+        """Apply local punctuation only to Chinese chunks in mixed text."""
+        chunks = split_text_for_mixed_punctuation(text)
+        processed_chunks: list[str] = []
+
+        for index, (is_chinese_chunk, chunk_text) in enumerate(chunks):
+            if not chunk_text:
+                continue
+
+            if not is_chinese_chunk:
+                processed_chunks.append(chunk_text)
+                continue
+
+            preclean_chunk = normalize_for_chinese_punctuation(chunk_text)
+            if not preclean_chunk.strip():
+                processed_chunks.append(chunk_text)
+                continue
+
+            log_transcript_stage(
+                session_id,
+                f"mixed.chunk{index + 1}.preclean",
+                preclean_chunk,
+            )
+            punctuated_chunk = self.add_local_chinese_punctuation(preclean_chunk)
+
+            # Avoid forced sentence stops right before an English chunk.
+            next_chunk = chunks[index + 1][1] if index + 1 < len(chunks) else ""
+            next_non_space = ""
+            for char in next_chunk:
+                if not char.isspace():
+                    next_non_space = char
+                    break
+            if next_non_space and is_latin_letter(next_non_space):
+                punctuated_chunk = strip_terminal_sentence_punctuation(punctuated_chunk)
+
+            log_transcript_stage(
+                session_id,
+                f"mixed.chunk{index + 1}.after_local_punc",
+                punctuated_chunk,
+            )
+            processed_chunks.append(punctuated_chunk)
+
+        return merge_mixed_chunks(processed_chunks)
 
     async def start_recording(self):
         """Start recording audio and connect to ElevenLabs"""
@@ -674,18 +887,51 @@ class DictationApp:
     async def _process_final_transcript(self, text: str, session_id: int):
         """Process final transcript: convert characters, add punctuation, paste."""
         async with self.paste_lock:
+            log_transcript_stage(session_id, "input.committed", text)
+
             # Step 1: OpenCC conversion (sync, fast)
             converted_text = self.chinese_converter.convert(text)
+            log_transcript_stage(session_id, "after.opencc", converted_text)
 
             # Step 2: Add punctuation if Chinese (run in executor to keep event loop responsive)
             if contains_chinese(converted_text):
-                loop = asyncio.get_running_loop()
-                converted_text = await loop.run_in_executor(
-                    None, self.add_local_chinese_punctuation, converted_text
+                if contains_latin_letters(converted_text):
+                    print(
+                        "ℹ️  Mixed Chinese/English detected: punctuation on Chinese chunks only"
+                    )
+                    log_transcript_stage(session_id, "mixed.input", converted_text)
+
+                    loop = asyncio.get_running_loop()
+                    converted_text = await loop.run_in_executor(
+                        None,
+                        self.add_local_chinese_punctuation_mixed,
+                        converted_text,
+                        session_id,
+                    )
+                    log_transcript_stage(
+                        session_id, "mixed.after_merge", converted_text
+                    )
+                else:
+                    normalized_for_punc = normalize_for_chinese_punctuation(
+                        converted_text
+                    )
+                    if normalized_for_punc.strip():
+                        converted_text = normalized_for_punc
+                    log_transcript_stage(session_id, "after.preclean", converted_text)
+
+                    loop = asyncio.get_running_loop()
+                    converted_text = await loop.run_in_executor(
+                        None, self.add_local_chinese_punctuation, converted_text
+                    )
+                    log_transcript_stage(session_id, "after.local_punc", converted_text)
+            else:
+                log_transcript_stage(
+                    session_id, "skip.local_punc.non_chinese", converted_text
                 )
 
             # Step 3: Paste
             paste_text(converted_text)
+            log_transcript_stage(session_id, "paste.output", converted_text)
             print(f"\n✅ Pasted: {converted_text}\n")
             self.last_partial_text = ""
 
@@ -741,6 +987,8 @@ class DictationApp:
         if not final_text:
             return
 
+        log_transcript_stage(session_id, "event.committed", final_text)
+
         # Deduplicate rapid repeated committed events for the same segment.
         # Keep only near-identical repeats, allow same text later in long sessions.
         now = time.monotonic()
@@ -748,6 +996,7 @@ class DictationApp:
         if last_committed:
             last_text, last_time = last_committed
             if last_text == final_text and (now - last_time) < 1.5:
+                log_transcript_stage(session_id, "dedupe.skip", final_text)
                 return
         self.last_committed_text_by_session[session_id] = (final_text, now)
 
