@@ -738,6 +738,26 @@ class DictationApp:
             # Create a NEW queue for this session (isolates from previous sessions)
             self.audio_queue = Queue(maxsize=MAX_AUDIO_QUEUE_CHUNKS)
 
+            previous_cleanup_task = self.cleanup_task
+
+        if previous_cleanup_task and not previous_cleanup_task.done():
+            print("⏳ Waiting for previous transcription cleanup...")
+            try:
+                await previous_cleanup_task
+            except Exception as e:
+                print(f"⚠️  Previous cleanup ended with error: {e}")
+
+            # The user may have released push-to-talk while this start was waiting.
+            if (
+                not self.is_recording
+                or self.active_session_id != current_session
+                or current_session in self.stopping_sessions
+            ):
+                self.commit_events.pop(current_session, None)
+                self.stopping_sessions.discard(current_session)
+                self.registered_connection_sessions.discard(current_session)
+                return
+
         # Start audio stream first to avoid dropping the beginning while websocket connects
         try:
             # Create PyAudio on demand (released in stop_recording to free Core Audio HAL)
