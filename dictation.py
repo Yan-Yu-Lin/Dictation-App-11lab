@@ -5,8 +5,10 @@ Press hotkey to start/stop recording, text is pasted when you finish speaking.
 """
 
 import argparse
+import array
 import asyncio
 import base64
+import math
 import os
 import sys
 import subprocess
@@ -193,6 +195,24 @@ def log_transcript_stage(session_id: int, stage: str, text: str):
         return
     preview = _log_preview_text(text)
     print(f"📊 [session {session_id}] {stage} (len={len(text)}): {preview}")
+
+
+def pcm16_level(audio_data: bytes) -> tuple[int, float]:
+    """Return peak and RMS amplitude for little-endian signed 16-bit PCM."""
+    if not audio_data:
+        return 0, 0.0
+
+    samples = array.array("h")
+    samples.frombytes(audio_data[: len(audio_data) - (len(audio_data) % 2)])
+    if sys.byteorder != "little":
+        samples.byteswap()
+
+    if not samples:
+        return 0, 0.0
+
+    peak = max(abs(sample) for sample in samples)
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+    return peak, rms
 
 
 class StatusOverlay(NSObject):
@@ -520,6 +540,8 @@ class DictationApp:
         self.audio_callback_counts: dict[int, int] = {}
         self.audio_drop_counts: dict[int, int] = {}
         self.sender_chunk_counts: dict[int, int] = {}
+        self.session_peak_audio: dict[int, int] = {}
+        self.session_rms_sum: dict[int, float] = {}
         self.sender_first_send_at: dict[int, float] = {}
         self.paste_lock = asyncio.Lock()
 
@@ -561,12 +583,12 @@ class DictationApp:
 
         print(f"ElevenLabs API Key: ...{elevenlabs_key[-4:]}")
 
-        # PyAudio is initialized once at startup. Repeatedly calling terminate()
-        # and re-creating PyAudio between sessions causes a known macOS
-        # PortAudio/HAL degraded state where audio_callback silently stops firing.
-        # The mic-access indicator is driven by open streams, not by holding
-        # PyAudio init, so keeping this alive does not show constant mic access.
+        # Keep PyAudio alive for the app lifetime. The input stream is opened
+        # lazily and then start/stop is reused across sessions. Avoid repeated
+        # close/open cycles on macOS because PortAudio/CoreAudio can produce
+        # callbacks with all-zero buffers after rapid device teardown.
         self.audio_interface = pyaudio.PyAudio()
+        self.audio_stream = None
 
         print("Dictation App Ready!")
         print(
@@ -574,6 +596,28 @@ class DictationApp:
         )
         print(f"Press Cmd+Option+Control+{TRIGGER_KEY.upper()} to start/stop recording")
         print("(Or press your Hyper Key + D if you have it configured)\n")
+
+    def _ensure_audio_stream(self):
+        """Open the microphone stream once; restart this stream between sessions."""
+        if self.audio_stream is not None:
+            return
+
+        self.audio_stream = self.audio_interface.open(
+            format=AUDIO_FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE,
+            stream_callback=self.audio_callback,
+        )
+
+    def _stop_audio_stream(self):
+        """Stop capture without closing the PortAudio stream object."""
+        try:
+            if self.audio_stream and self.audio_stream.is_active():
+                self.audio_stream.stop_stream()
+        except Exception as e:
+            print(f"⚠️  Error stopping audio stream: {e}")
 
     def _load_local_punctuation_model(self):
         """Load local punctuation model once so it is ready for every Chinese transcript."""
@@ -782,37 +826,37 @@ class DictationApp:
             self.audio_callback_counts[current_session] = 0
             self.audio_drop_counts[current_session] = 0
             self.sender_chunk_counts[current_session] = 0
+            self.session_peak_audio[current_session] = 0
+            self.session_rms_sum[current_session] = 0.0
 
             # Create a NEW queue for this session (isolates from previous sessions)
             self.audio_queue = Queue(maxsize=MAX_AUDIO_QUEUE_CHUNKS)
             self.audio_queue_session_id = current_session
 
-        # Start audio stream first to avoid dropping the beginning while websocket connects
+        # Start the existing stream object instead of closing/re-opening the
+        # CoreAudio device every session.
         try:
-            self.audio_stream = self.audio_interface.open(
-                format=AUDIO_FORMAT,
-                channels=CHANNELS,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE,
-                stream_callback=self.audio_callback,
-            )
-            self.audio_stream.start_stream()
+            self._ensure_audio_stream()
+            if not self.audio_stream.is_active():
+                self.audio_stream.start_stream()
 
-            # Only play start sound after mic is actually active
             play_sound(SOUND_START, SOUND_START_VOLUME)
             set_overlay_recording()
             print("\n🎙️  Recording started. Listening now...")
             print("🔄 Connecting to ElevenLabs realtime...")
-
         except Exception as e:
             print(f"❌ Error starting audio stream: {e}")
             hide_overlay()
+            if self.audio_stream is not None:
+                try:
+                    self.audio_stream.close()
+                except Exception:
+                    pass
+                self.audio_stream = None
             async with self.session_lock:
                 if self.active_session_id == current_session:
                     self.is_recording = False
                     self.active_session_id = None
-                    self.audio_stream = None
                     self.audio_queue = None
                     self.audio_queue_session_id = None
                 self.commit_events.pop(current_session, None)
@@ -891,11 +935,8 @@ class DictationApp:
             if current_session in self.stopping_sessions:
                 return
             hide_overlay()
+            self._stop_audio_stream()
             if self.active_session_id == current_session:
-                if self.audio_stream:
-                    self.audio_stream.stop_stream()
-                    self.audio_stream.close()
-                self.audio_stream = None
                 self.audio_queue = None
                 self.audio_queue_session_id = None
                 self.current_sender_task = None
@@ -911,11 +952,8 @@ class DictationApp:
             if current_session in self.stopping_sessions:
                 return
             hide_overlay()
+            self._stop_audio_stream()
             if self.active_session_id == current_session:
-                if self.audio_stream:
-                    self.audio_stream.stop_stream()
-                    self.audio_stream.close()
-                self.audio_stream = None
                 self.audio_queue = None
                 self.audio_queue_session_id = None
                 self.current_sender_task = None
@@ -959,12 +997,20 @@ class DictationApp:
                     )
                     chunk_count = self.sender_chunk_counts.get(session_id, 0) + 1
                     self.sender_chunk_counts[session_id] = chunk_count
+                    chunk_peak, chunk_rms = pcm16_level(audio_data)
+                    if chunk_peak > self.session_peak_audio.get(session_id, 0):
+                        self.session_peak_audio[session_id] = chunk_peak
+                    self.session_rms_sum[session_id] = (
+                        self.session_rms_sum.get(session_id, 0.0) + chunk_rms
+                    )
                     if chunk_count == 1:
                         self.sender_first_send_at[session_id] = time.monotonic()
                         callback_count = self.audio_callback_counts.get(session_id, 0)
+                        peak, rms = pcm16_level(audio_data)
                         print(
                             f"📡 First audio chunk sent "
-                            f"(session {session_id}, callbacks={callback_count})"
+                            f"(session {session_id}, callbacks={callback_count}, "
+                            f"peak={peak}, rms={rms:.1f})"
                         )
                     elif chunk_count % 20 == 0:
                         callback_count = self.audio_callback_counts.get(session_id, 0)
@@ -986,9 +1032,12 @@ class DictationApp:
             callback_count = self.audio_callback_counts.get(session_id, 0)
             chunk_count = self.sender_chunk_counts.get(session_id, 0)
             drop_count = self.audio_drop_counts.get(session_id, 0)
+            session_peak = self.session_peak_audio.get(session_id, 0)
+            avg_rms = self.session_rms_sum.get(session_id, 0.0) / max(chunk_count, 1)
             print(
                 f"📡 Sender task stopped (session {session_id}, "
-                f"sent={chunk_count}, callbacks={callback_count}, drops={drop_count})"
+                f"sent={chunk_count}, callbacks={callback_count}, drops={drop_count}, "
+                f"peak={session_peak}, avg_rms={avg_rms:.1f})"
             )
 
     async def stop_recording(self):
@@ -1017,10 +1066,9 @@ class DictationApp:
                 except asyncio.CancelledError:
                     pass  # Expected
 
-            # CRITICAL: Immediately stop the audio stream to prevent callback pollution
-            if self.audio_stream:
-                self.audio_stream.stop_stream()
-                self.audio_stream.close()
+            # Stop capture so macOS can release the active mic indicator, but
+            # keep the same PortAudio stream object for the next session.
+            self._stop_audio_stream()
 
             # Capture references to current session's resources
             old_connection = self.connection
@@ -1036,7 +1084,6 @@ class DictationApp:
             )
 
             # Clear references immediately so new session can start
-            self.audio_stream = None
             self.connection = None
             self.audio_queue = None
             self.audio_queue_session_id = None
@@ -1155,6 +1202,8 @@ class DictationApp:
             self.audio_callback_counts.pop(session_to_cleanup, None)
             self.audio_drop_counts.pop(session_to_cleanup, None)
             self.sender_chunk_counts.pop(session_to_cleanup, None)
+            self.session_peak_audio.pop(session_to_cleanup, None)
+            self.session_rms_sum.pop(session_to_cleanup, None)
             self.sender_first_send_at.pop(session_to_cleanup, None)
             # Clear active session only if this cleanup belongs to the active one
             if self.active_session_id == session_to_cleanup:
@@ -1415,14 +1464,15 @@ class RightShiftPTTMonitor:
 
 # Global hotkey handler using QuickMacHotKey
 # This automatically intercepts and blocks the hotkey from reaching other apps (like terminal)
+_hotkey_press_count = 0
+
+
 @quickHotKey(virtualKey=kVK_ANSI_D, modifierMask=mask(cmdKey, controlKey, optionKey))
 def handle_hotkey():
-    """
-    Handle the global hotkey Cmd+Option+Control+D.
-    QuickMacHotKey automatically consumes the keypress, preventing it from reaching other apps.
-    """
-    global app, event_loop
-
+    global app, event_loop, _hotkey_press_count
+    _hotkey_press_count += 1
+    is_rec = app.is_recording if app else False
+    print(f"⌨️  Hotkey fired #{_hotkey_press_count} at {time.monotonic():.3f}s (is_recording={is_rec})")
     if app and event_loop:
         if not app.is_recording:
             asyncio.run_coroutine_threadsafe(app.start_recording(), event_loop)
