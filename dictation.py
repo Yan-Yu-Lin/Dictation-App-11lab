@@ -553,10 +553,12 @@ class DictationApp:
 
         print(f"ElevenLabs API Key: ...{elevenlabs_key[-4:]}")
 
-        # PyAudio is created on-demand per recording session to avoid holding
-        # the Core Audio HAL open (which macOS reports as constant mic access
-        # and can interfere with speaker output).
-        self.audio_interface = None
+        # PyAudio is initialized once at startup. Repeatedly calling terminate()
+        # and re-creating PyAudio between sessions causes a known macOS
+        # PortAudio/HAL degraded state where audio_callback silently stops firing.
+        # The mic-access indicator is driven by open streams, not by holding
+        # PyAudio init, so keeping this alive does not show constant mic access.
+        self.audio_interface = pyaudio.PyAudio()
 
         print("Dictation App Ready!")
         print(
@@ -740,9 +742,6 @@ class DictationApp:
 
         # Start audio stream first to avoid dropping the beginning while websocket connects
         try:
-            # Create PyAudio on demand (released in stop_recording to free Core Audio HAL)
-            self.audio_interface = pyaudio.PyAudio()
-
             self.audio_stream = self.audio_interface.open(
                 format=AUDIO_FORMAT,
                 channels=CHANNELS,
@@ -762,14 +761,11 @@ class DictationApp:
         except Exception as e:
             print(f"❌ Error starting audio stream: {e}")
             hide_overlay()
-            if self.audio_interface:
-                self.audio_interface.terminate()
             async with self.session_lock:
                 if self.active_session_id == current_session:
                     self.is_recording = False
                     self.active_session_id = None
                     self.audio_stream = None
-                    self.audio_interface = None
                     self.audio_queue = None
                 self.commit_events.pop(current_session, None)
             return
@@ -851,10 +847,7 @@ class DictationApp:
                 if self.audio_stream:
                     self.audio_stream.stop_stream()
                     self.audio_stream.close()
-                if self.audio_interface:
-                    self.audio_interface.terminate()
                 self.audio_stream = None
-                self.audio_interface = None
                 self.audio_queue = None
                 self.current_sender_task = None
                 self.connection = None
@@ -873,10 +866,7 @@ class DictationApp:
                 if self.audio_stream:
                     self.audio_stream.stop_stream()
                     self.audio_stream.close()
-                if self.audio_interface:
-                    self.audio_interface.terminate()
                 self.audio_stream = None
-                self.audio_interface = None
                 self.audio_queue = None
                 self.current_sender_task = None
                 self.connection = None
@@ -944,9 +934,6 @@ class DictationApp:
             if self.audio_stream:
                 self.audio_stream.stop_stream()
                 self.audio_stream.close()
-            # Release Core Audio HAL so macOS stops showing mic access
-            if self.audio_interface:
-                self.audio_interface.terminate()
 
             # Capture references to current session's resources
             old_connection = self.connection
@@ -955,7 +942,6 @@ class DictationApp:
 
             # Clear references immediately so new session can start
             self.audio_stream = None
-            self.audio_interface = None
             self.connection = None
             self.audio_queue = None
             self.current_sender_task = None
