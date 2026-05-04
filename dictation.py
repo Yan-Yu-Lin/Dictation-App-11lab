@@ -27,6 +27,7 @@ from elevenlabs import (
     RealtimeEvents,
     RealtimeAudioOptions,
 )
+from elevenlabs.realtime.connection import RealtimeConnection
 # funasr (and torch) imported lazily in _load_local_punctuation_model to speed up non-local modes
 from openai import OpenAI
 from pynput.keyboard import Controller, Key
@@ -502,6 +503,7 @@ class DictationApp:
         self.connection = None
         self.last_partial_text = ""
         self.audio_queue = None  # Will be created per session
+        self.audio_queue_session_id = None
         self.session_id = 0  # Track session number to handle parallel cleanup
         self.current_sender_task = None  # Track the current send_audio_chunks task
         self.session_lock = asyncio.Lock()  # Serialize start/stop
@@ -512,8 +514,13 @@ class DictationApp:
         self.connect_tasks: dict[int, asyncio.Task] = {}
         self.stopping_sessions: set[int] = set()
         self.registered_connection_sessions: set[int] = set()
+        self.session_started_sessions: set[int] = set()
         self.commit_events: dict[int, asyncio.Event] = {}
         self.last_committed_text_by_session: dict[int, tuple[str, float]] = {}
+        self.audio_callback_counts: dict[int, int] = {}
+        self.audio_drop_counts: dict[int, int] = {}
+        self.sender_chunk_counts: dict[int, int] = {}
+        self.sender_first_send_at: dict[int, float] = {}
         self.paste_lock = asyncio.Lock()
 
         # Initialize Chinese character converter
@@ -530,6 +537,7 @@ class DictationApp:
             print("ERROR: ELEVENLABS_API_KEY not found in .env file")
             sys.exit(1)
 
+        self._install_realtime_event_history_patch()
         self.elevenlabs = ElevenLabs(api_key=elevenlabs_key)
 
         # Punctuation mode
@@ -695,6 +703,40 @@ class DictationApp:
             print(f"⚠️  OpenRouter punctuation error, using original text: {e}")
             return text
 
+    @staticmethod
+    def _install_realtime_event_history_patch():
+        """Record SDK-emitted events so early session_started can be replayed."""
+        if getattr(RealtimeConnection, "_dictation_event_history_patch", False):
+            return
+
+        original_emit = RealtimeConnection._emit
+
+        def emit_with_history(connection, event, *args):
+            history = getattr(connection, "_dictation_event_history", None)
+            if history is None:
+                history = []
+                connection._dictation_event_history = history
+            history.append((event, args))
+            return original_emit(connection, event, *args)
+
+        RealtimeConnection._emit = emit_with_history
+        RealtimeConnection._dictation_event_history_patch = True
+
+    def _replay_early_session_started(self, connection, session_id: int):
+        """Replay session_started if the SDK emitted it before handlers existed."""
+        if session_id in self.session_started_sessions:
+            return
+
+        for event, args in getattr(connection, "_dictation_event_history", []):
+            event_value = getattr(event, "value", event)
+            if event_value != RealtimeEvents.SESSION_STARTED.value:
+                continue
+
+            data = args[0] if args else {}
+            print(f"🔁 Replaying early session_started event (session {session_id})")
+            self.on_session_started(data, session_id)
+            return
+
     def _register_connection_handlers(self, connection, session_id: int):
         """Register WebSocket event handlers once for a session."""
         if session_id in self.registered_connection_sessions:
@@ -721,6 +763,7 @@ class DictationApp:
             lambda *_, sid=session_id: self.on_close(sid),
         )
         self.registered_connection_sessions.add(session_id)
+        self._replay_early_session_started(connection, session_id)
 
     async def start_recording(self):
         """Start recording audio and connect to ElevenLabs"""
@@ -736,9 +779,13 @@ class DictationApp:
             current_session = self.session_id
             self.active_session_id = current_session
             self.commit_events[current_session] = asyncio.Event()
+            self.audio_callback_counts[current_session] = 0
+            self.audio_drop_counts[current_session] = 0
+            self.sender_chunk_counts[current_session] = 0
 
             # Create a NEW queue for this session (isolates from previous sessions)
             self.audio_queue = Queue(maxsize=MAX_AUDIO_QUEUE_CHUNKS)
+            self.audio_queue_session_id = current_session
 
         # Start audio stream first to avoid dropping the beginning while websocket connects
         try:
@@ -767,6 +814,7 @@ class DictationApp:
                     self.active_session_id = None
                     self.audio_stream = None
                     self.audio_queue = None
+                    self.audio_queue_session_id = None
                 self.commit_events.pop(current_session, None)
             return
 
@@ -849,6 +897,7 @@ class DictationApp:
                     self.audio_stream.close()
                 self.audio_stream = None
                 self.audio_queue = None
+                self.audio_queue_session_id = None
                 self.current_sender_task = None
                 self.connection = None
                 self.is_recording = False
@@ -868,6 +917,7 @@ class DictationApp:
                     self.audio_stream.close()
                 self.audio_stream = None
                 self.audio_queue = None
+                self.audio_queue_session_id = None
                 self.current_sender_task = None
                 self.connection = None
                 self.is_recording = False
@@ -878,13 +928,25 @@ class DictationApp:
 
     async def send_audio_chunks(self, connection, audio_queue: Queue, session_id: int):
         """Send audio chunks from the queue to ElevenLabs for one session."""
+        print(f"📡 Sender task started (session {session_id})")
+        last_wait_log = time.monotonic()
         try:
-            while self.is_recording:
+            while self.is_recording and self.active_session_id == session_id:
                 try:
                     # Get audio chunk from queue (non-blocking with timeout)
                     try:
                         audio_data = audio_queue.get(timeout=0.01)
                     except Empty:
+                        now = time.monotonic()
+                        if now - last_wait_log >= 0.75:
+                            callback_count = self.audio_callback_counts.get(
+                                session_id, 0
+                            )
+                            print(
+                                f"📡 Waiting for audio chunks "
+                                f"(session {session_id}, callbacks={callback_count})"
+                            )
+                            last_wait_log = now
                         await asyncio.sleep(0.01)
                         continue
 
@@ -895,6 +957,23 @@ class DictationApp:
                     await connection.send(
                         {"audio_base_64": audio_base64, "sample_rate": SAMPLE_RATE}
                     )
+                    chunk_count = self.sender_chunk_counts.get(session_id, 0) + 1
+                    self.sender_chunk_counts[session_id] = chunk_count
+                    if chunk_count == 1:
+                        self.sender_first_send_at[session_id] = time.monotonic()
+                        callback_count = self.audio_callback_counts.get(session_id, 0)
+                        print(
+                            f"📡 First audio chunk sent "
+                            f"(session {session_id}, callbacks={callback_count})"
+                        )
+                    elif chunk_count % 20 == 0:
+                        callback_count = self.audio_callback_counts.get(session_id, 0)
+                        drop_count = self.audio_drop_counts.get(session_id, 0)
+                        print(
+                            f"📡 Sent {chunk_count} audio chunks "
+                            f"(session {session_id}, callbacks={callback_count}, "
+                            f"drops={drop_count})"
+                        )
 
                 except Exception as e:
                     print(f"⚠️  Error sending audio (session {session_id}): {e}")
@@ -903,6 +982,14 @@ class DictationApp:
         except asyncio.CancelledError:
             # Task was cancelled, clean exit
             pass
+        finally:
+            callback_count = self.audio_callback_counts.get(session_id, 0)
+            chunk_count = self.sender_chunk_counts.get(session_id, 0)
+            drop_count = self.audio_drop_counts.get(session_id, 0)
+            print(
+                f"📡 Sender task stopped (session {session_id}, "
+                f"sent={chunk_count}, callbacks={callback_count}, drops={drop_count})"
+            )
 
     async def stop_recording(self):
         """Stop recording and commit the transcript"""
@@ -939,11 +1026,20 @@ class DictationApp:
             old_connection = self.connection
             old_audio_queue = self.audio_queue
             old_connect_task = self.connect_tasks.get(current_session)
+            queued_chunks = old_audio_queue.qsize() if old_audio_queue else 0
+            print(
+                f"📊 Session {current_session} audio summary before cleanup: "
+                f"callbacks={self.audio_callback_counts.get(current_session, 0)}, "
+                f"sent={self.sender_chunk_counts.get(current_session, 0)}, "
+                f"queued={queued_chunks}, "
+                f"drops={self.audio_drop_counts.get(current_session, 0)}"
+            )
 
             # Clear references immediately so new session can start
             self.audio_stream = None
             self.connection = None
             self.audio_queue = None
+            self.audio_queue_session_id = None
             self.current_sender_task = None
 
             # Clean up old session asynchronously in background and remember task
@@ -978,6 +1074,9 @@ class DictationApp:
                 {"audio_base_64": audio_base64, "sample_rate": SAMPLE_RATE}
             )
             flushed += 1
+            self.sender_chunk_counts[session_to_cleanup] = (
+                self.sender_chunk_counts.get(session_to_cleanup, 0) + 1
+            )
 
         if flushed > 0:
             print(
@@ -1052,6 +1151,11 @@ class DictationApp:
             self.connect_tasks.pop(session_to_cleanup, None)
             self.stopping_sessions.discard(session_to_cleanup)
             self.registered_connection_sessions.discard(session_to_cleanup)
+            self.session_started_sessions.discard(session_to_cleanup)
+            self.audio_callback_counts.pop(session_to_cleanup, None)
+            self.audio_drop_counts.pop(session_to_cleanup, None)
+            self.sender_chunk_counts.pop(session_to_cleanup, None)
+            self.sender_first_send_at.pop(session_to_cleanup, None)
             # Clear active session only if this cleanup belongs to the active one
             if self.active_session_id == session_to_cleanup:
                 self.active_session_id = None
@@ -1121,13 +1225,30 @@ class DictationApp:
 
     def audio_callback(self, in_data, frame_count, time_info, status):
         """Callback for audio stream - put chunks in queue"""
-        # Capture reference locally to prevent race condition
+        # Capture session-bound references locally to prevent cross-session pollution.
+        session_id = self.active_session_id
+        queue_session_id = self.audio_queue_session_id
         queue = self.audio_queue
-        if self.is_recording and queue is not None:
+        if (
+            self.is_recording
+            and session_id is not None
+            and queue is not None
+            and queue_session_id == session_id
+        ):
+            callback_count = self.audio_callback_counts.get(session_id, 0) + 1
+            self.audio_callback_counts[session_id] = callback_count
+            if callback_count == 1 or callback_count % 20 == 0:
+                print(
+                    f"🎧 Audio callback active "
+                    f"(session {session_id}, callbacks={callback_count})"
+                )
             try:
                 queue.put_nowait(in_data)
             except Full:
                 # Keep newest audio if buffer is full
+                self.audio_drop_counts[session_id] = (
+                    self.audio_drop_counts.get(session_id, 0) + 1
+                )
                 try:
                     queue.get_nowait()
                 except Empty:
@@ -1141,6 +1262,7 @@ class DictationApp:
 
     def on_session_started(self, data, session_id):
         """Called when WebSocket session starts"""
+        self.session_started_sessions.add(session_id)
         if session_id != self.active_session_id:
             return
         print("🔌 Connected to ElevenLabs Scribe v2 Realtime")
@@ -1224,6 +1346,7 @@ class RightShiftPTTMonitor:
         self.monitor_token = None
         self.right_shift_down = False
         self.started_session = False
+        self.press_id = 0
 
     def start(self):
         if self.monitor_token is not None:
@@ -1237,15 +1360,15 @@ class RightShiftPTTMonitor:
     def stop(self):
         if self.monitor_token is not None:
             NSEvent.removeMonitor_(self.monitor_token)
-            self.monitor_token = None
+        self.monitor_token = None
         self.right_shift_down = False
         self.started_session = False
 
-    async def _stop_when_possible(self):
+    async def _stop_when_possible(self, press_id: int):
         """Stop recording after a right-shift release, even if start is still in flight."""
         global app
         for _ in range(25):
-            if self.right_shift_down:
+            if self.right_shift_down or press_id != self.press_id:
                 return
             if app and app.is_recording:
                 await app.stop_recording()
@@ -1272,6 +1395,7 @@ class RightShiftPTTMonitor:
                 return
 
             if is_down:
+                self.press_id += 1
                 if not app.is_recording:
                     self.started_session = True
                     asyncio.run_coroutine_threadsafe(app.start_recording(), event_loop)
@@ -1279,9 +1403,10 @@ class RightShiftPTTMonitor:
                     self.started_session = False
             else:
                 if self.started_session:
+                    press_id = self.press_id
                     self.started_session = False
                     asyncio.run_coroutine_threadsafe(
-                        self._stop_when_possible(),
+                        self._stop_when_possible(press_id),
                         event_loop,
                     )
         except Exception as e:
