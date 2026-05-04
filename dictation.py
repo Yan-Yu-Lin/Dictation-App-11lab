@@ -642,6 +642,19 @@ class DictationApp:
                     "Realtime client unavailable in current ElevenLabs SDK"
                 )
 
+            if not getattr(realtime_client, "_dictation_no_verbatim_patch", False):
+                original_build_websocket_url = realtime_client._build_websocket_url
+
+                def build_websocket_url_with_no_verbatim(*args, **kwargs):
+                    url = original_build_websocket_url(*args, **kwargs)
+                    separator = "&" if "?" in url else "?"
+                    return f"{url}{separator}no_verbatim=true"
+
+                realtime_client._build_websocket_url = (
+                    build_websocket_url_with_no_verbatim
+                )
+                realtime_client._dictation_no_verbatim_patch = True
+
             new_connection = await asyncio.wait_for(
                 realtime_client.connect(
                     RealtimeAudioOptions(
