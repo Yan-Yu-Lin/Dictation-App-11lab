@@ -88,6 +88,7 @@ CHARACTER_REPLACEMENTS_PATH = os.path.join(
 DEFAULT_CHARACTER_REPLACEMENTS = {
     "纔": "才",
 }
+TRAILING_STRIP_CHARS = "。"
 
 # OpenRouter punctuation via Claude Haiku 4.5
 OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
@@ -220,6 +221,11 @@ def pcm16_level(audio_data: bytes) -> tuple[int, float]:
     peak = max(abs(sample) for sample in samples)
     rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
     return peak, rms
+
+
+def strip_trailing_final_punctuation(text: str) -> str:
+    """Strip final punctuation characters that should never be pasted at the end."""
+    return text.rstrip(TRAILING_STRIP_CHARS)
 
 
 class StatusOverlay(NSObject):
@@ -1333,6 +1339,12 @@ class DictationApp:
                 log_transcript_stage(
                     session_id, "skip.punc", converted_text
                 )
+
+            stripped_text = strip_trailing_final_punctuation(converted_text)
+            if stripped_text != converted_text:
+                print("🧹 Stripped trailing 。")
+            converted_text = stripped_text
+            log_transcript_stage(session_id, "after.strip_trailing", converted_text)
 
             # Step 4: Paste
             paste_text(converted_text)
