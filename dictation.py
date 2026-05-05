@@ -8,6 +8,7 @@ import argparse
 import array
 import asyncio
 import base64
+import json
 import math
 import os
 import sys
@@ -81,6 +82,12 @@ CONNECT_TIMEOUT_SECONDS = 8.0
 FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
 LOCAL_PUNC_MODEL_ID = "ct-punc"
 TRANSCRIPT_DEBUG_LOG = os.getenv("DICTATION_TRANSCRIPT_DEBUG", "1") != "0"
+CHARACTER_REPLACEMENTS_PATH = os.path.join(
+    os.path.dirname(__file__), "character_replacements.json"
+)
+DEFAULT_CHARACTER_REPLACEMENTS = {
+    "纔": "才",
+}
 
 # OpenRouter punctuation via Claude Haiku 4.5
 OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
@@ -552,6 +559,7 @@ class DictationApp:
             self.chinese_converter = opencc.OpenCC("s2t")
         else:
             self.chinese_converter = opencc.OpenCC("t2s")
+        self.character_replacement_items = self._load_character_replacements()
 
         # Initialize ElevenLabs client
         elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
@@ -618,6 +626,60 @@ class DictationApp:
                 self.audio_stream.stop_stream()
         except Exception as e:
             print(f"⚠️  Error stopping audio stream: {e}")
+
+    def _load_character_replacements(self) -> list[tuple[str, str]]:
+        """Load literal character replacements, longest source first."""
+        replacements = dict(DEFAULT_CHARACTER_REPLACEMENTS)
+
+        try:
+            with open(CHARACTER_REPLACEMENTS_PATH, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+
+            if not isinstance(loaded, dict):
+                raise ValueError("top-level JSON value must be an object")
+
+            for source, target in loaded.items():
+                if not isinstance(source, str) or not isinstance(target, str):
+                    raise ValueError("all replacement keys and values must be strings")
+                if not source:
+                    raise ValueError("replacement keys cannot be empty strings")
+                replacements[source] = target
+        except FileNotFoundError:
+            print(
+                "⚠️  character_replacements.json not found; "
+                "using built-in replacements"
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            print(
+                f"⚠️  Failed to load character_replacements.json ({e}); "
+                "using built-in replacements"
+            )
+            replacements = dict(DEFAULT_CHARACTER_REPLACEMENTS)
+
+        replacement_items = sorted(
+            replacements.items(), key=lambda item: len(item[0]), reverse=True
+        )
+        print(f"🔤 Character replacements loaded: {len(replacement_items)}")
+        return replacement_items
+
+    def apply_character_replacements(self, text: str) -> str:
+        """Apply literal character replacements using longest match first.
+
+        Prints a before/after log when any replacement actually fires, listing
+        which mappings were used.
+        """
+        original = text
+        applied: list[str] = []
+        for source, target in self.character_replacement_items:
+            if source in text:
+                count = text.count(source)
+                applied.append(f"{source}→{target} (×{count})")
+                text = text.replace(source, target)
+        if applied:
+            print(f"🔤 Replacements applied: {', '.join(applied)}")
+            print(f"   before: {original}")
+            print(f"   after:  {text}")
+        return text
 
     def _load_local_punctuation_model(self):
         """Load local punctuation model once so it is ready for every Chinese transcript."""
@@ -1224,7 +1286,13 @@ class DictationApp:
             converted_text = self.chinese_converter.convert(text)
             log_transcript_stage(session_id, "after.opencc", converted_text)
 
-            # Step 2: Punctuation + filler cleanup (run in executor to keep event loop responsive)
+            # Step 2: User-configurable literal replacements after OpenCC.
+            converted_text = self.apply_character_replacements(converted_text)
+            log_transcript_stage(
+                session_id, "after.character_replacements", converted_text
+            )
+
+            # Step 3: Punctuation + filler cleanup (run in executor to keep event loop responsive)
             if self.punc_mode == "openrouter":
                 loop = asyncio.get_running_loop()
                 converted_text = await loop.run_in_executor(
@@ -1266,7 +1334,7 @@ class DictationApp:
                     session_id, "skip.punc", converted_text
                 )
 
-            # Step 3: Paste
+            # Step 4: Paste
             paste_text(converted_text)
             log_transcript_stage(session_id, "paste.output", converted_text)
             print(f"\n✅ Pasted: {converted_text}\n")
