@@ -11,6 +11,7 @@ import base64
 import json
 import math
 import os
+import re
 import sys
 import subprocess
 import threading
@@ -89,6 +90,8 @@ DEFAULT_CHARACTER_REPLACEMENTS = {
     "纔": "才",
 }
 TRAILING_STRIP_CHARS = "。"
+TRAILING_CUTOFF_DASH_CHARS = "-–—"
+DICTATION_ELLIPSIS_ARTIFACT_RE = re.compile(r"[.．]{2,}|…+")
 
 # OpenRouter punctuation via Claude Haiku 4.5
 OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
@@ -223,9 +226,34 @@ def pcm16_level(audio_data: bytes) -> tuple[int, float]:
     return peak, rms
 
 
+def remove_dictation_ellipsis_artifacts(text: str) -> str:
+    """Remove STT ellipsis pause/cutoff artifacts anywhere in the transcript.
+
+    Scribe can emit "......" / "……" when speech drops or pauses. For dictation,
+    those are almost always noise, even mid-sentence. A single English period is
+    preserved because that may be intentional punctuation.
+    """
+    return DICTATION_ELLIPSIS_ARTIFACT_RE.sub("", text)
+
+
 def strip_trailing_final_punctuation(text: str) -> str:
-    """Strip final punctuation characters that should never be pasted at the end."""
-    return text.rstrip(TRAILING_STRIP_CHARS)
+    """Strip dictation artifacts that should never be pasted.
+
+    Ellipsis artifacts are removed anywhere: "它有一個......this" -> "它有一個this".
+    Dash cutoff markers are only removed at the end: "它有一個--" -> "它有一個".
+    Internal dashes/hyphens are preserved.
+    """
+    stripped = remove_dictation_ellipsis_artifacts(text).rstrip()
+
+    while stripped:
+        before = stripped
+        stripped = stripped.rstrip(TRAILING_STRIP_CHARS).rstrip()
+        stripped = stripped.rstrip(TRAILING_CUTOFF_DASH_CHARS).rstrip()
+
+        if stripped == before:
+            break
+
+    return stripped
 
 
 class StatusOverlay(NSObject):
@@ -1342,7 +1370,7 @@ class DictationApp:
 
             stripped_text = strip_trailing_final_punctuation(converted_text)
             if stripped_text != converted_text:
-                print("🧹 Stripped trailing 。")
+                print("🧹 Stripped trailing dictation cutoff marker")
             converted_text = stripped_text
             log_transcript_stage(session_id, "after.strip_trailing", converted_text)
 
