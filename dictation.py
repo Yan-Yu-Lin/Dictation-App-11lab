@@ -92,6 +92,9 @@ DEFAULT_CHARACTER_REPLACEMENTS = {
 TRAILING_STRIP_CHARS = "。"
 TRAILING_CUTOFF_DASH_CHARS = "-–—"
 DICTATION_ELLIPSIS_ARTIFACT_RE = re.compile(r"[.．]{2,}|…+")
+PASTE_REPLACEMENT_CHAR = "\ufffd"
+PASTE_ZERO_WIDTH_CHARS = frozenset(("\u200b", "\u200c", "\u200d", "\ufeff"))
+PASTE_ALLOWED_CONTROL_CHARS = frozenset(("\n", "\t", "\r"))
 
 # OpenRouter punctuation via Claude Haiku 4.5
 OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
@@ -256,6 +259,45 @@ def strip_trailing_final_punctuation(text: str) -> str:
     return stripped
 
 
+def sanitize_for_paste(text: str) -> str:
+    """Remove damaged Unicode and invisible/control characters before paste."""
+    sanitized_chars = []
+    replacement_count = 0
+    zero_width_count = 0
+    control_count = 0
+
+    for char in text:
+        if char == PASTE_REPLACEMENT_CHAR:
+            replacement_count += 1
+            continue
+        if char in PASTE_ZERO_WIDTH_CHARS:
+            zero_width_count += 1
+            continue
+        if (
+            unicodedata.category(char) == "Cc"
+            and char not in PASTE_ALLOWED_CONTROL_CHARS
+        ):
+            control_count += 1
+            continue
+        sanitized_chars.append(char)
+
+    total_count = replacement_count + zero_width_count + control_count
+    if total_count:
+        categories = []
+        if replacement_count:
+            categories.append(f"u+fffd ×{replacement_count}")
+        if zero_width_count:
+            categories.append(f"zero-width ×{zero_width_count}")
+        if control_count:
+            categories.append(f"control ×{control_count}")
+        print(
+            f"🧹 Sanitized {total_count} chars before paste: "
+            + ", ".join(categories)
+        )
+
+    return "".join(sanitized_chars)
+
+
 class StatusOverlay(NSObject):
     """Small always-on-top circular indicator for dictation state."""
 
@@ -372,6 +414,8 @@ class StatusOverlay(NSObject):
 
 def paste_text(text):
     """Paste text using clipboard (much faster than typing)"""
+    text = sanitize_for_paste(text)
+
     try:
         # Save current clipboard
         old_clipboard = pyperclip.paste()
