@@ -33,6 +33,14 @@ ElevenLabs Scribe v2 Realtime API and pastes the result at your cursor.
 - **System packages for the status dot**: `python-gobject`, `gtk4`,
   `gtk4-layer-shell` (the dot runs on the system python3, outside the venv)
 - Membership in the **`input` group** for Right Shift push-to-talk
+- **If you use keyd**: it collapses right/left modifiers, emitting Right Shift
+  as `KEY_LEFTSHIFT` — push-to-talk never fires. Add this to
+  `/etc/keyd/default.conf` and `sudo keyd reload`:
+
+  ```ini
+  [main]
+  rightshift = rightshift
+  ```
 - **Python 3.13+** managed by uv
 - **ElevenLabs API key**
 
