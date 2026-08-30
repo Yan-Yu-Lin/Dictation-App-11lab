@@ -449,6 +449,50 @@ def write_clipboard(text: str) -> bool:
         return False
 
 
+_uinput_keyboard = None
+
+
+def get_uinput_keyboard():
+    """Lazily create a kernel-level virtual keyboard for the paste chord.
+
+    wtype uses the Wayland virtual-keyboard protocol, which games and many
+    XWayland apps never see. uinput events are indistinguishable from a real
+    keyboard, so they reach everything. Needs write access to /dev/uinput
+    (covered by the `input` group on this machine).
+    """
+    global _uinput_keyboard
+    if _uinput_keyboard is None:
+        from evdev import UInput, ecodes
+
+        _uinput_keyboard = UInput(
+            {ecodes.EV_KEY: [ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTSHIFT, ecodes.KEY_V]},
+            name="dictation-paste-keyboard",
+        )
+        time.sleep(0.5)  # let keyd/Hyprland enumerate the new device
+    return _uinput_keyboard
+
+
+def press_paste_chord_uinput(with_shift: bool):
+    """Send Ctrl(+Shift)+V as real kernel input events."""
+    from evdev import ecodes
+
+    ui = get_uinput_keyboard()
+    mods = [ecodes.KEY_LEFTCTRL] + ([ecodes.KEY_LEFTSHIFT] if with_shift else [])
+    for key in mods:
+        ui.write(ecodes.EV_KEY, key, 1)
+    ui.syn()
+    time.sleep(0.03)
+    ui.write(ecodes.EV_KEY, ecodes.KEY_V, 1)
+    ui.syn()
+    time.sleep(0.06)  # hold V across at least one game frame-poll
+    ui.write(ecodes.EV_KEY, ecodes.KEY_V, 0)
+    ui.syn()
+    time.sleep(0.03)
+    for key in reversed(mods):
+        ui.write(ecodes.EV_KEY, key, 0)
+    ui.syn()
+
+
 def type_text_directly(text: str):
     """Fallback: type the text with wtype instead of pasting."""
     subprocess.run(["wtype", "--", text], timeout=10, check=True)
@@ -473,12 +517,18 @@ def paste_text(text):
             raise RuntimeError("wl-copy failed")
         time.sleep(0.15)  # Let the clipboard offer settle before pasting
 
-        # Simulate the paste chord in the focused window
-        if active_window_is_terminal():
-            chord = ["-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl"]
-        else:
-            chord = ["-M", "ctrl", "-k", "v", "-m", "ctrl"]
-        subprocess.run(["wtype", *chord], timeout=5, check=True)
+        # Simulate the paste chord in the focused window.
+        # uinput first (reaches games/XWayland); wtype as fallback.
+        with_shift = active_window_is_terminal()
+        try:
+            press_paste_chord_uinput(with_shift)
+        except Exception as uinput_error:
+            print(f"⚠️  uinput chord failed ({uinput_error}); falling back to wtype")
+            if with_shift:
+                chord = ["-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl"]
+            else:
+                chord = ["-M", "ctrl", "-k", "v", "-m", "ctrl"]
+            subprocess.run(["wtype", *chord], timeout=5, check=True)
 
         # Delay before restoring clipboard (gives time for paste and clipboard managers)
         time.sleep(0.6)
@@ -1469,6 +1519,15 @@ if __name__ == "__main__":
         help="Disable hold-to-talk on Right Shift (Hyper+D toggle stays enabled)",
     )
     args = parser.parse_args()
+
+    # Warm up the uinput virtual keyboard so the first paste doesn't pay the
+    # device-enumeration delay. Missing /dev/uinput access just means the
+    # wtype fallback will handle chords.
+    try:
+        get_uinput_keyboard()
+        print("⌨️  uinput paste keyboard ready")
+    except Exception as e:
+        print(f"⚠️  uinput unavailable ({e}); paste will use wtype only")
 
     try:
         asyncio.run(
