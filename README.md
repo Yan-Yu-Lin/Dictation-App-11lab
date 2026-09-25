@@ -9,7 +9,8 @@ A real-time dictation tool that transcribes your speech as you speak using Eleve
 - **Global hotkey control**: Press Cmd+Option+Control+D to start/stop recording (works anywhere)
 - **Push-to-talk**: Hold **Right Shift** to record, release to stop
 - **Hotkey interception**: The hotkey is consumed by the app and won't reach other applications (no terminal escape sequences)
-- **Floating status indicator**: Small on-screen chip shows recording/finalizing state
+- **Floating status indicator**: Small on-screen dot shows recording (pulsing red) / finalizing (orange) state
+- **Live preview**: The dot expands into a capsule showing partial transcripts as you speak, already converted to Traditional Chinese
 - **Auto-paste**: Transcribed text is automatically pasted at your cursor position
 - **Low latency**: ~150ms transcription delay using Scribe v2 Realtime
 - **Model-native punctuation**: Scribe v2 Realtime returns punctuated transcripts directly

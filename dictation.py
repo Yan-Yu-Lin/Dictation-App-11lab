@@ -20,6 +20,7 @@ import unicodedata
 from queue import Empty, Full, Queue
 from typing import Optional
 
+import objc
 import opencc
 import pyaudio
 import pyperclip
@@ -32,9 +33,14 @@ from AppKit import (
     NSEvent,
     NSEventMaskFlagsChanged,
     NSEventModifierFlagShift,
+    NSFont,
+    NSFontAttributeName,
+    NSLineBreakByTruncatingHead,
     NSPanel,
     NSScreen,
     NSStatusWindowLevel,
+    NSTextAlignmentRight,
+    NSTextField,
     NSView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
@@ -52,9 +58,14 @@ from elevenlabs import (
     RealtimeEvents,
 )
 from elevenlabs.realtime.connection import RealtimeConnection
-from Foundation import NSMakeRect, NSObject
+from Foundation import NSAttributedString, NSMakeRect, NSObject
 from pynput.keyboard import Controller, Key
 from PyObjCTools import AppHelper
+from Quartz import (
+    CABasicAnimation,
+    CAMediaTimingFunction,
+    kCAMediaTimingFunctionEaseInEaseOut,
+)
 
 # QuickMacHotKey for global hotkey interception (blocks keypress from reaching other apps)
 from quickmachotkey import mask, quickHotKey
@@ -129,6 +140,12 @@ def set_overlay_finalizing():
     global status_overlay
     if status_overlay:
         AppHelper.callAfter(status_overlay.show_finalizing)
+
+
+def set_overlay_partial(text: str):
+    global status_overlay
+    if status_overlay:
+        AppHelper.callAfter(status_overlay.show_partial, text)
 
 
 def hide_overlay():
@@ -240,24 +257,44 @@ def sanitize_for_paste(text: str) -> str:
 
 
 class StatusOverlay(NSObject):
-    """Small always-on-top circular indicator for dictation state."""
+    """Always-on-top dictation indicator with live transcript preview.
+
+    Idle sessions show just a pulsing red dot (recording) or orange dot
+    (finalizing); as partial transcripts stream in, the capsule widens to
+    preview what is being transcribed (newest words stay visible).
+    """
 
     WIDTH = 30
     HEIGHT = 30
     TOP_MARGIN = 18
     DOT_SIZE = 10
+    TEXT_SPACING = 8  # gap between dot and preview text
+    TEXT_PADDING_RIGHT = 12
+    MAX_TEXT_WIDTH = 460  # px; older words scroll away (truncated at the head)
+    FONT_SIZE = 13
+    PULSE_KEY = "dictationPulse"
 
     def init(self):
-        self = super().init()
+        self = objc.super(StatusOverlay, self).init()
         if self is None:
             return None
 
         self.panel = None
         self.dot_view = None
+        self.preview_label = None
+        self.preview_font = NSFont.systemFontOfSize_(self.FONT_SIZE)
+        self.text_width = 0
+        self.screen_frame = None
         self._create_panel()
         return self
 
-    def _screen_rect(self):
+    def _current_width(self) -> float:
+        if self.text_width <= 0:
+            return self.WIDTH
+        return self.WIDTH + self.text_width + self.TEXT_PADDING_RIGHT
+
+    def _pick_screen_frame(self):
+        """Visible frame of the screen under the mouse (or main screen)."""
         point = NSEvent.mouseLocation()
         screen = None
         for candidate in NSScreen.screens():
@@ -273,14 +310,20 @@ class StatusOverlay(NSObject):
         if screen is None:
             screen = NSScreen.mainScreen()
 
-        if screen is None:
-            return NSMakeRect(40, 40, self.WIDTH, self.HEIGHT)
-        frame = screen.visibleFrame()
-        x = frame.origin.x + (frame.size.width - self.WIDTH) / 2
+        return screen.visibleFrame() if screen is not None else None
+
+    def _screen_rect(self):
+        """Panel rect centered top-of-screen for the current capsule width."""
+        width = self._current_width()
+        frame = self.screen_frame
+        if frame is None:
+            return NSMakeRect(40, 40, width, self.HEIGHT)
+        x = frame.origin.x + (frame.size.width - width) / 2
         y = frame.origin.y + frame.size.height - self.HEIGHT - self.TOP_MARGIN
-        return NSMakeRect(x, y, self.WIDTH, self.HEIGHT)
+        return NSMakeRect(x, y, width, self.HEIGHT)
 
     def _create_panel(self):
+        self.screen_frame = self._pick_screen_frame()
         frame = self._screen_rect()
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             frame,
@@ -325,6 +368,29 @@ class StatusOverlay(NSObject):
         dot_layer.setBackgroundColor_(NSColor.systemRedColor().CGColor())
         content.addSubview_(self.dot_view)
 
+        line_height = self.preview_font.ascender() - self.preview_font.descender()
+        label_height = math.ceil(line_height) + 2
+        self.preview_label = NSTextField.labelWithString_("")
+        self.preview_label.setFont_(self.preview_font)
+        self.preview_label.setTextColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.92, 0.92, 0.94, 0.92
+            )
+        )
+        self.preview_label.setAlignment_(NSTextAlignmentRight)
+        self.preview_label.setLineBreakMode_(NSLineBreakByTruncatingHead)
+        self.preview_label.setUsesSingleLineMode_(True)
+        self.preview_label.setFrame_(
+            NSMakeRect(
+                self.WIDTH - (self.WIDTH - self.DOT_SIZE) / 2 + self.TEXT_SPACING,
+                (self.HEIGHT - label_height) / 2,
+                0,
+                label_height,
+            )
+        )
+        self.preview_label.setHidden_(True)
+        content.addSubview_(self.preview_label)
+
         self.hide()
 
     def _set_dot_color(self, color):
@@ -334,23 +400,82 @@ class StatusOverlay(NSObject):
         if dot_layer:
             dot_layer.setBackgroundColor_(color.CGColor())
 
+    def _set_pulsing(self, pulsing: bool):
+        dot_layer = self.dot_view.layer() if self.dot_view else None
+        if not dot_layer:
+            return
+        if not pulsing:
+            dot_layer.removeAnimationForKey_(self.PULSE_KEY)
+            return
+        if dot_layer.animationForKey_(self.PULSE_KEY) is not None:
+            return
+        pulse = CABasicAnimation.animationWithKeyPath_("opacity")
+        pulse.setFromValue_(1.0)
+        pulse.setToValue_(0.35)
+        pulse.setDuration_(0.8)
+        pulse.setAutoreverses_(True)
+        pulse.setRepeatCount_(float("inf"))
+        pulse.setTimingFunction_(
+            CAMediaTimingFunction.functionWithName_(
+                kCAMediaTimingFunctionEaseInEaseOut
+            )
+        )
+        dot_layer.addAnimation_forKey_(pulse, self.PULSE_KEY)
+
+    def _measure_text_width(self, text: str) -> int:
+        attributed = NSAttributedString.alloc().initWithString_attributes_(
+            text, {NSFontAttributeName: self.preview_font}
+        )
+        return min(math.ceil(attributed.size().width) + 6, self.MAX_TEXT_WIDTH)
+
+    def _apply_width(self):
+        """Resize the capsule around the preview text (instant, no animation)."""
+        if not self.panel:
+            return
+        label_frame = self.preview_label.frame()
+        label_frame.size.width = self.text_width
+        self.preview_label.setFrame_(label_frame)
+        self.preview_label.setHidden_(self.text_width <= 0)
+        self.panel.setFrame_display_(self._screen_rect(), True)
+
     def show_recording(self):
         if not self.panel:
             return
+        # Pick the screen once per session so the capsule doesn't jump
+        # between displays while the mouse moves.
+        self.screen_frame = self._pick_screen_frame()
+        self.preview_label.setStringValue_("")
+        self.text_width = 0
         self._set_dot_color(NSColor.systemRedColor())
-        self.panel.setFrame_display_(self._screen_rect(), True)
+        self._set_pulsing(True)
+        self._apply_width()
         self.panel.orderFrontRegardless()
 
     def show_finalizing(self):
         if not self.panel:
             return
         self._set_dot_color(NSColor.systemOrangeColor())
-        self.panel.setFrame_display_(self._screen_rect(), True)
+        self._set_pulsing(False)
+        self._apply_width()
         self.panel.orderFrontRegardless()
+
+    def show_partial(self, text: str):
+        if not self.panel:
+            return
+        text = text.replace("\n", " ").strip()
+        if not text:
+            return
+        self.preview_label.setStringValue_(text)
+        self.text_width = self._measure_text_width(text)
+        self._apply_width()
 
     def hide(self):
         if self.panel:
             self.panel.orderOut_(None)
+        if self.preview_label:
+            self.preview_label.setStringValue_("")
+        self.text_width = 0
+        self._set_pulsing(False)
 
 
 def paste_text(text):
@@ -1018,8 +1143,10 @@ class DictationApp:
                 self.last_partial_text = ""
                 return
 
-            # Step 4: Paste
-            paste_text(converted_text)
+            # Step 4: Paste (run in executor: paste_text sleeps while the
+            # clipboard restore is pending, which would stall the event loop)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, paste_text, converted_text)
             log_transcript_stage(session_id, "paste.output", converted_text)
             print(f"\n✅ Pasted: {converted_text}\n")
             self.last_partial_text = ""
@@ -1077,9 +1204,18 @@ class DictationApp:
         if not new_text:
             return
 
-        # Update internal state and show progress in console
+        # Update internal state and show progress in console + live preview.
+        # Preview goes through OpenCC + replacements so it reads 繁體, not
+        # whatever variant Scribe happens to emit mid-stream.
         self.last_partial_text = new_text
         print(f"📝 Processing: {new_text}")
+        try:
+            preview_text = self.chinese_converter.convert(new_text)
+            for source, target in self.character_replacement_items:
+                preview_text = preview_text.replace(source, target)
+        except Exception:
+            preview_text = new_text
+        set_overlay_partial(preview_text)
 
     def on_committed_transcript(self, data, session_id):
         """Called when final transcript is committed"""
@@ -1124,6 +1260,11 @@ class DictationApp:
         if session_id != self.active_session_id:
             return
         print("🔌 Connection closed")
+        # If the server dropped us mid-recording (auth error, network loss),
+        # abort the session instead of letting the sender spin on a dead socket.
+        if self.is_recording and event_loop:
+            print("⚠️  Connection lost while recording; stopping session")
+            asyncio.run_coroutine_threadsafe(self.stop_recording(), event_loop)
 
     def cleanup(self):
         """Clean up resources"""
