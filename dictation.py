@@ -12,39 +12,17 @@ import json
 import math
 import os
 import re
-import sys
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
-from queue import Queue, Empty, Full
+from queue import Empty, Full, Queue
 from typing import Optional
 
 import opencc
 import pyaudio
 import pyperclip
-from dotenv import load_dotenv
-from elevenlabs import (
-    AudioFormat,
-    CommitStrategy,
-    ElevenLabs,
-    RealtimeEvents,
-    RealtimeAudioOptions,
-)
-from elevenlabs.realtime.connection import RealtimeConnection
-# funasr (and torch) imported lazily in _load_local_punctuation_model to speed up non-local modes
-from openai import OpenAI
-from pynput.keyboard import Controller, Key
-
-# QuickMacHotKey for global hotkey interception (blocks keypress from reaching other apps)
-from quickmachotkey import quickHotKey, mask
-from quickmachotkey.constants import (
-    kVK_ANSI_D,
-    kVK_RightShift,
-    cmdKey,
-    controlKey,
-    optionKey,
-)
 
 # PyObjC imports for NSApplication
 from AppKit import (
@@ -65,8 +43,28 @@ from AppKit import (
     NSWindowCollectionBehaviorTransient,
     NSWindowStyleMaskBorderless,
 )
+from dotenv import load_dotenv
+from elevenlabs import (
+    AudioFormat,
+    CommitStrategy,
+    ElevenLabs,
+    RealtimeAudioOptions,
+    RealtimeEvents,
+)
+from elevenlabs.realtime.connection import RealtimeConnection
 from Foundation import NSMakeRect, NSObject
+from pynput.keyboard import Controller, Key
 from PyObjCTools import AppHelper
+
+# QuickMacHotKey for global hotkey interception (blocks keypress from reaching other apps)
+from quickmachotkey import mask, quickHotKey
+from quickmachotkey.constants import (
+    cmdKey,
+    controlKey,
+    kVK_ANSI_D,
+    kVK_RightShift,
+    optionKey,
+)
 
 # Load environment variables
 load_dotenv()
@@ -81,7 +79,6 @@ CHANNELS = 1  # Mono
 MAX_AUDIO_QUEUE_CHUNKS = 120  # ~30s of buffered audio at CHUNK_SIZE=4096
 CONNECT_TIMEOUT_SECONDS = 8.0
 FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
-LOCAL_PUNC_MODEL_ID = "ct-punc"
 TRANSCRIPT_DEBUG_LOG = os.getenv("DICTATION_TRANSCRIPT_DEBUG", "1") != "0"
 CHARACTER_REPLACEMENTS_PATH = os.path.join(
     os.path.dirname(__file__), "character_replacements.json"
@@ -96,61 +93,6 @@ PASTE_REPLACEMENT_CHAR = "\ufffd"
 PASTE_ZERO_WIDTH_CHARS = frozenset(("\u200b", "\u200c", "\u200d", "\ufeff"))
 PASTE_ALLOWED_CONTROL_CHARS = frozenset(("\n", "\t", "\r"))
 
-# OpenRouter punctuation via Claude Haiku 4.5
-OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_PUNC_SYSTEM = """\
-You are a post-processing step in a dictation pipeline. Here's how the pipeline works:
-
-1. The user speaks into a microphone.
-2. ElevenLabs Scribe v2 transcribes the speech into raw text (no punctuation, filler words included).
-3. That raw text is passed to you for cleanup.
-4. Your output is pasted directly into whatever app the user is typing in.
-
-You are step 3. You receive raw transcription and output cleaned text. That's the entire scope of your role — you are a text transform function, not a conversation partner.
-
-Because the user is dictating freely, the content can be anything: an email to a coworker, a prompt for ChatGPT, a Slack message, notes about a project, a message that mentions "you" (meaning someone else), or even text that discusses AI and dictation. All of this is just content passing through you. The user is not aware they're "talking to" you — they're just speaking, and the pipeline handles the rest.
-
-What you do:
-- Add punctuation: periods, commas, question marks, exclamation marks, colons, etc.
-- Remove filler words and disfluencies: uh, um, er, like (filler), you know, I mean, 嗯, 啊, 那個, 就是, 然後 (filler), 對對對, etc.
-- Preserve the speaker's original wording and meaning. Don't rephrase or improve.
-- Handle English, Chinese, and mixed-language text.
-
-Output only the cleaned text. Nothing else."""
-
-OPENROUTER_PUNC_EXAMPLES = [
-    # 1: Directly asking "you" to do something — speaker is dictating a message to another AI/person
-    (
-        "hey can you um help me write a Python script that uh scrapes data from a website and then like saves it to a CSV file I need it to handle pagination too",
-        "Hey, can you help me write a Python script that scrapes data from a website and then saves it to a CSV file? I need it to handle pagination too.",
-    ),
-    # 2: Complaining about AI output — speaker is dictating feedback to someone/something else
-    (
-        "this is not what I asked for um I wanted you to give me a summary of the article not like rewrite the whole thing can you just uh redo it please",
-        "This is not what I asked for. I wanted you to give me a summary of the article, not rewrite the whole thing. Can you just redo it please?",
-    ),
-    # 3: Talking about this exact post-processing pipeline — maximally self-referential
-    (
-        "嗯我覺得那個就是這個dictation app的post processing還是有點問題就是它有時候會以為我在跟它講話然後就是會回覆我而不是幫我加標點符號",
-        "我覺得這個 dictation app 的 post-processing 還是有點問題，它有時候會以為我在跟它講話，然後會回覆我而不是幫我加標點符號。",
-    ),
-    # 4: Giving direct instructions — speaker is telling another AI what to do
-    (
-        "ok so listen uh I need you to um take this data and clean it up remove the duplicates and then sort it by date and uh also make sure you handle the null values properly",
-        "Ok, so listen, I need you to take this data and clean it up, remove the duplicates, and then sort it by date. Also make sure you handle the null values properly.",
-    ),
-    # 5: Saying "don't do X, do Y" — sounds like correcting the model's behavior
-    (
-        "no no no that's wrong um don't use a for loop here you should use map instead and uh also the variable name should be like user underscore list not just users",
-        "No, no, no, that's wrong. Don't use a for loop here, you should use map instead. Also the variable name should be user_list, not just users.",
-    ),
-    # 6: Mixed language casual with fillers
-    (
-        "嗯 ok so basically就是我明天要去台北然後 um I need to pick up the package before like 3pm 然後那個如果你可以幫我 book一個 uber 就好了",
-        "Ok, so basically 就是我明天要去台北，然後 I need to pick up the package before 3pm。如果你可以幫我 book 一個 Uber 就好了。",
-    ),
-]
 
 # Sound effects (macOS system sounds)
 SOUND_START = "/System/Library/Sounds/Pop.aiff"  # Sound when recording starts
@@ -291,8 +233,7 @@ def sanitize_for_paste(text: str) -> str:
         if control_count:
             categories.append(f"control ×{control_count}")
         print(
-            f"🧹 Sanitized {total_count} chars before paste: "
-            + ", ".join(categories)
+            f"🧹 Sanitized {total_count} chars before paste: " + ", ".join(categories)
         )
 
     return "".join(sanitized_chars)
@@ -441,167 +382,8 @@ def paste_text(text):
         keyboard_controller.type(text)
 
 
-def is_chinese_char(char: str) -> bool:
-    """Check if a character is a CJK ideograph."""
-    code = ord(char)
-    return (
-        0x4E00 <= code <= 0x9FFF  # CJK Unified Ideographs
-        or 0x3400 <= code <= 0x4DBF  # CJK Unified Ideographs Extension A
-    )
-
-
-def contains_chinese(text: str) -> bool:
-    """Check if text contains Chinese characters."""
-    for char in text:
-        if is_chinese_char(char):
-            return True
-    return False
-
-
-def contains_latin_letters(text: str) -> bool:
-    """Check if text contains basic Latin letters (A-Z/a-z)."""
-    for char in text:
-        if is_latin_letter(char):
-            return True
-    return False
-
-
-def is_latin_letter(char: str) -> bool:
-    """Check if a character is a basic Latin letter."""
-    return ("a" <= char <= "z") or ("A" <= char <= "Z")
-
-
-def is_punctuation(char: str) -> bool:
-    """Check if a character is punctuation."""
-    return unicodedata.category(char).startswith("P")
-
-
-def normalize_for_chinese_punctuation(text: str) -> str:
-    """Clean only Chinese-adjacent spaces/punctuation before punctuation pass.
-
-    This keeps English spacing intact for mixed-language dictation while still
-    removing noisy separators around Chinese text.
-    """
-    chars = list(text)
-    normalized_chars = []
-
-    for i, char in enumerate(chars):
-        prev_is_zh = i > 0 and is_chinese_char(chars[i - 1])
-        next_is_zh = i + 1 < len(chars) and is_chinese_char(chars[i + 1])
-        near_zh = prev_is_zh or next_is_zh
-        prev_is_latin = i > 0 and (
-            ("a" <= chars[i - 1] <= "z") or ("A" <= chars[i - 1] <= "Z")
-        )
-        next_is_latin = i + 1 < len(chars) and (
-            ("a" <= chars[i + 1] <= "z") or ("A" <= chars[i + 1] <= "Z")
-        )
-
-        # Remove spaces only inside Chinese segments, keep boundary spaces between
-        # Chinese and English words for readability.
-        if char.isspace():
-            if prev_is_zh and next_is_zh:
-                continue
-            if prev_is_zh and not next_is_latin:
-                continue
-            if next_is_zh and not prev_is_latin:
-                continue
-
-        if is_punctuation(char) and near_zh:
-            continue
-
-        normalized_chars.append(char)
-
-    return "".join(normalized_chars)
-
-
-def split_text_for_mixed_punctuation(text: str) -> list[tuple[bool, str]]:
-    """Split text into chunks for mixed Chinese/English punctuation processing.
-
-    Returns a list of (is_chinese_chunk, chunk_text), preserving original order.
-    Chinese chunks include Chinese chars and nearby separators.
-    """
-    if not text:
-        return []
-
-    chars = list(text)
-
-    def chunk_is_chinese(i: int) -> bool:
-        char = chars[i]
-        if is_chinese_char(char):
-            return True
-
-        if not (char.isspace() or is_punctuation(char)):
-            return False
-
-        prev_is_zh = i > 0 and is_chinese_char(chars[i - 1])
-        next_is_zh = i + 1 < len(chars) and is_chinese_char(chars[i + 1])
-        prev_is_latin = i > 0 and is_latin_letter(chars[i - 1])
-        next_is_latin = i + 1 < len(chars) and is_latin_letter(chars[i + 1])
-
-        # Keep separators with Chinese, unless clearly between Latin words.
-        return (prev_is_zh or next_is_zh) and not (prev_is_latin and next_is_latin)
-
-    chunks: list[tuple[bool, str]] = []
-    current_is_zh = chunk_is_chinese(0)
-    current_chars = [chars[0]]
-
-    for i in range(1, len(chars)):
-        is_zh = chunk_is_chinese(i)
-        if is_zh == current_is_zh:
-            current_chars.append(chars[i])
-            continue
-
-        chunks.append((current_is_zh, "".join(current_chars)))
-        current_is_zh = is_zh
-        current_chars = [chars[i]]
-
-    chunks.append((current_is_zh, "".join(current_chars)))
-    return chunks
-
-
-def strip_terminal_sentence_punctuation(text: str) -> str:
-    """Remove terminal sentence punctuation from a chunk."""
-    trimmed = text.rstrip()
-    while trimmed and trimmed[-1] in "。！？.!?":
-        trimmed = trimmed[:-1].rstrip()
-    return trimmed
-
-
-def merge_mixed_chunks(chunks: list[str]) -> str:
-    """Merge processed chunks and preserve readable boundaries."""
-    merged = ""
-
-    for chunk in chunks:
-        if not chunk:
-            continue
-
-        if not merged:
-            merged = chunk
-            continue
-
-        prev = merged[-1]
-        curr = chunk[0]
-        needs_space = (
-            (is_chinese_char(prev) and is_latin_letter(curr))
-            or (is_latin_letter(prev) and is_chinese_char(curr))
-            or (prev in "。！？.!?" and is_latin_letter(curr))
-        )
-
-        if (
-            needs_space
-            and not prev.isspace()
-            and not curr.isspace()
-            and not is_punctuation(curr)
-        ):
-            merged += " "
-
-        merged += chunk
-
-    return merged
-
-
 class DictationApp:
-    def __init__(self, chinese="tw", punc_mode="openrouter"):
+    def __init__(self, chinese="tw"):
         self.is_recording = False
         self.audio_stream = None
         self.audio_interface = None
@@ -647,25 +429,6 @@ class DictationApp:
 
         self._install_realtime_event_history_patch()
         self.elevenlabs = ElevenLabs(api_key=elevenlabs_key)
-
-        # Punctuation mode
-        self.punc_mode = punc_mode
-        self.local_punc_model = None
-        self.openrouter_client = None
-
-        if punc_mode == "openrouter":
-            openrouter_key = os.getenv("OPENROUTER_API_KEY")
-            if not openrouter_key:
-                print("ERROR: OPENROUTER_API_KEY not found in .env file")
-                sys.exit(1)
-            self.openrouter_client = OpenAI(
-                base_url=OPENROUTER_BASE_URL, api_key=openrouter_key
-            )
-            print(f"🤖 Punctuation: OpenRouter ({OPENROUTER_MODEL})")
-        elif punc_mode == "local":
-            self.local_punc_model = self._load_local_punctuation_model()
-        else:
-            print("⏭️  Punctuation disabled")
 
         print(f"ElevenLabs API Key: ...{elevenlabs_key[-4:]}")
 
@@ -724,8 +487,7 @@ class DictationApp:
                 replacements[source] = target
         except FileNotFoundError:
             print(
-                "⚠️  character_replacements.json not found; "
-                "using built-in replacements"
+                "⚠️  character_replacements.json not found; using built-in replacements"
             )
         except (OSError, json.JSONDecodeError, ValueError) as e:
             print(
@@ -758,134 +520,6 @@ class DictationApp:
             print(f"   before: {original}")
             print(f"   after:  {text}")
         return text
-
-    def _load_local_punctuation_model(self):
-        """Load local punctuation model once so it is ready for every Chinese transcript."""
-        try:
-            from funasr import AutoModel
-
-            print(
-                f"Loading local punctuation model '{LOCAL_PUNC_MODEL_ID}'... "
-                "(first run may download model files)"
-            )
-            model = AutoModel(
-                model=LOCAL_PUNC_MODEL_ID,
-                trust_remote_code=False,
-                disable_update=True,
-                device="cpu",
-            )
-            print("✅ Local punctuation model loaded")
-            return model
-        except Exception as e:
-            print(
-                f"ERROR: Failed to load local punctuation model '{LOCAL_PUNC_MODEL_ID}': {e}"
-            )
-            sys.exit(1)
-
-    @staticmethod
-    def _extract_punctuation_output(result, fallback_text: str) -> str:
-        """Extract punctuated text from FunASR output payload."""
-        if isinstance(result, list) and result:
-            first = result[0]
-            if isinstance(first, dict):
-                text = first.get("text")
-                if isinstance(text, str) and text.strip():
-                    return text.strip()
-
-        if isinstance(result, str) and result.strip():
-            return result.strip()
-
-        return fallback_text
-
-    def add_local_chinese_punctuation(self, text: str) -> str:
-        """Use local CT-Punc model to add punctuation."""
-        if not text.strip():
-            return text
-
-        started = time.perf_counter()
-        try:
-            result = self.local_punc_model.generate(input=text, disable_pbar=True)
-            punctuated = self._extract_punctuation_output(result, text)
-            elapsed_ms = int((time.perf_counter() - started) * 1000)
-            print(f"✍️  Local Chinese punctuation added ({elapsed_ms}ms)")
-            return punctuated
-        except Exception as e:
-            print(f"⚠️  Local punctuation error, using original text: {e}")
-            return text
-
-    def add_local_chinese_punctuation_mixed(self, text: str, session_id: int) -> str:
-        """Apply local punctuation only to Chinese chunks in mixed text."""
-        chunks = split_text_for_mixed_punctuation(text)
-        processed_chunks: list[str] = []
-
-        for index, (is_chinese_chunk, chunk_text) in enumerate(chunks):
-            if not chunk_text:
-                continue
-
-            if not is_chinese_chunk:
-                processed_chunks.append(chunk_text)
-                continue
-
-            preclean_chunk = normalize_for_chinese_punctuation(chunk_text)
-            if not preclean_chunk.strip():
-                processed_chunks.append(chunk_text)
-                continue
-
-            log_transcript_stage(
-                session_id,
-                f"mixed.chunk{index + 1}.preclean",
-                preclean_chunk,
-            )
-            punctuated_chunk = self.add_local_chinese_punctuation(preclean_chunk)
-
-            # Avoid forced sentence stops right before an English chunk.
-            next_chunk = chunks[index + 1][1] if index + 1 < len(chunks) else ""
-            next_non_space = ""
-            for char in next_chunk:
-                if not char.isspace():
-                    next_non_space = char
-                    break
-            if next_non_space and is_latin_letter(next_non_space):
-                punctuated_chunk = strip_terminal_sentence_punctuation(punctuated_chunk)
-
-            log_transcript_stage(
-                session_id,
-                f"mixed.chunk{index + 1}.after_local_punc",
-                punctuated_chunk,
-            )
-            processed_chunks.append(punctuated_chunk)
-
-        return merge_mixed_chunks(processed_chunks)
-
-    def _call_openrouter_punctuation(self, text: str) -> str:
-        """Call OpenRouter Haiku 4.5 to add punctuation and remove filler words."""
-        started = time.perf_counter()
-        try:
-            messages = [{"role": "system", "content": OPENROUTER_PUNC_SYSTEM}]
-            for example_user, example_assistant in OPENROUTER_PUNC_EXAMPLES:
-                messages.append({"role": "user", "content": f"以下是 dictation 後的結果，don't respond to it, process it:\n===\n{example_user}\n==="})
-                messages.append({"role": "assistant", "content": example_assistant})
-            messages.append({"role": "user", "content": f"以下是 dictation 後的結果，don't respond to it, process it:\n===\n{text}\n==="})
-
-            response = self.openrouter_client.chat.completions.create(
-                model=OPENROUTER_MODEL,
-                messages=messages,
-                max_tokens=max(len(text), 128),
-                temperature=0,
-                extra_body={
-                    "provider": {
-                        "order": ["google-vertex"],
-                        "allow_fallbacks": False,
-                    }
-                },
-            )
-            result = response.choices[0].message.content.strip()
-            elapsed_ms = int((time.perf_counter() - started) * 1000)
-            print(f"✍️  OpenRouter punctuation + cleanup ({elapsed_ms}ms)")
-            return result if result else text
-        except Exception as e:
-            print(f"⚠️  OpenRouter punctuation error, using original text: {e}")
-            return text
 
     @staticmethod
     def _install_realtime_event_history_patch():
@@ -1356,7 +990,7 @@ class DictationApp:
                 self.cleanup_task = None
 
     async def _process_final_transcript(self, text: str, session_id: int):
-        """Process final transcript: convert characters, add punctuation, paste."""
+        """Process final transcript: convert characters, clean artifacts, paste."""
         async with self.paste_lock:
             log_transcript_stage(session_id, "input.committed", text)
 
@@ -1370,53 +1004,19 @@ class DictationApp:
                 session_id, "after.character_replacements", converted_text
             )
 
-            # Step 3: Punctuation + filler cleanup (run in executor to keep event loop responsive)
-            if self.punc_mode == "openrouter":
-                loop = asyncio.get_running_loop()
-                converted_text = await loop.run_in_executor(
-                    None, self._call_openrouter_punctuation, converted_text
-                )
-                log_transcript_stage(session_id, "after.openrouter_punc", converted_text)
-            elif self.punc_mode == "local" and contains_chinese(converted_text):
-                if contains_latin_letters(converted_text):
-                    print(
-                        "ℹ️  Mixed Chinese/English detected: punctuation on Chinese chunks only"
-                    )
-                    log_transcript_stage(session_id, "mixed.input", converted_text)
-
-                    loop = asyncio.get_running_loop()
-                    converted_text = await loop.run_in_executor(
-                        None,
-                        self.add_local_chinese_punctuation_mixed,
-                        converted_text,
-                        session_id,
-                    )
-                    log_transcript_stage(
-                        session_id, "mixed.after_merge", converted_text
-                    )
-                else:
-                    normalized_for_punc = normalize_for_chinese_punctuation(
-                        converted_text
-                    )
-                    if normalized_for_punc.strip():
-                        converted_text = normalized_for_punc
-                    log_transcript_stage(session_id, "after.preclean", converted_text)
-
-                    loop = asyncio.get_running_loop()
-                    converted_text = await loop.run_in_executor(
-                        None, self.add_local_chinese_punctuation, converted_text
-                    )
-                    log_transcript_stage(session_id, "after.local_punc", converted_text)
-            else:
-                log_transcript_stage(
-                    session_id, "skip.punc", converted_text
-                )
-
+            # Step 3: Remove dictation cutoff artifacts.
             stripped_text = strip_trailing_final_punctuation(converted_text)
             if stripped_text != converted_text:
                 print("🧹 Stripped trailing dictation cutoff marker")
             converted_text = stripped_text
             log_transcript_stage(session_id, "after.strip_trailing", converted_text)
+
+            # A suppression replacement can intentionally remove the whole transcript.
+            if not converted_text.strip():
+                log_transcript_stage(session_id, "paste.skip_empty", converted_text)
+                print("🧹 Suppressed empty/no-speech transcript")
+                self.last_partial_text = ""
+                return
 
             # Step 4: Paste
             paste_text(converted_text)
@@ -1508,7 +1108,7 @@ class DictationApp:
         self.last_committed_text_by_session[session_id] = (final_text, now)
 
         if event_loop:
-            # Schedule async processing (OpenCC + local Chinese punctuation + paste)
+            # Schedule async processing (OpenCC + replacements + paste)
             asyncio.run_coroutine_threadsafe(
                 self._process_final_transcript(final_text, session_id), event_loop
             )
@@ -1624,7 +1224,9 @@ def handle_hotkey():
     global app, event_loop, _hotkey_press_count
     _hotkey_press_count += 1
     is_rec = app.is_recording if app else False
-    print(f"⌨️  Hotkey fired #{_hotkey_press_count} at {time.monotonic():.3f}s (is_recording={is_rec})")
+    print(
+        f"⌨️  Hotkey fired #{_hotkey_press_count} at {time.monotonic():.3f}s (is_recording={is_rec})"
+    )
     if app and event_loop:
         if not app.is_recording:
             asyncio.run_coroutine_threadsafe(app.start_recording(), event_loop)
@@ -1652,7 +1254,7 @@ class AppDelegate(NSObject):
         print("Press Ctrl+C to exit.\n")
 
 
-def setup_async_loop(chinese, punc_mode="openrouter"):
+def setup_async_loop(chinese):
     """Set up the async event loop in a separate thread."""
     global app, event_loop
 
@@ -1662,7 +1264,7 @@ def setup_async_loop(chinese, punc_mode="openrouter"):
     event_loop = loop
 
     # Create app instance
-    app = DictationApp(chinese=chinese, punc_mode=punc_mode)
+    app = DictationApp(chinese=chinese)
 
     # Signal that initialization is complete
     async_loop_ready.set()
@@ -1671,7 +1273,7 @@ def setup_async_loop(chinese, punc_mode="openrouter"):
     loop.run_forever()
 
 
-def start_app(chinese="tw", enable_right_shift_ptt=True, punc_mode="openrouter"):
+def start_app(chinese="tw", enable_right_shift_ptt=True):
     """Start the application with NSApplication event loop."""
     global right_shift_ptt_enabled, right_shift_ptt_monitor
 
@@ -1680,7 +1282,7 @@ def start_app(chinese="tw", enable_right_shift_ptt=True, punc_mode="openrouter")
 
     # Start asyncio event loop in a separate thread
     async_thread = threading.Thread(
-        target=setup_async_loop, args=(chinese, punc_mode), daemon=True
+        target=setup_async_loop, args=(chinese,), daemon=True
     )
     async_thread.start()
 
@@ -1729,21 +1331,8 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable hold-to-talk on Right Shift (Cmd+Option+Control+D toggle stays enabled)",
     )
-    parser.add_argument(
-        "--punc-mode",
-        choices=["openrouter", "local", "off"],
-        default="openrouter",
-        help="Punctuation mode: openrouter (Haiku 4.5, default), local (CT-Punc), off",
-    )
-    parser.add_argument(
-        "--no-punc",
-        action="store_true",
-        help=argparse.SUPPRESS,  # Hidden alias for --punc-mode off
-    )
     args = parser.parse_args()
-    punc_mode = "off" if args.no_punc else args.punc_mode
     start_app(
         chinese=args.chinese,
         enable_right_shift_ptt=not args.disable_right_shift_ptt,
-        punc_mode=punc_mode,
     )

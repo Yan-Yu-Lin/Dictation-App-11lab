@@ -11,4 +11,12 @@ Add entries as JSON key/value pairs:
 }
 ```
 
+Use an empty replacement value to suppress a literal transcription artifact:
+
+```json
+{
+  "（聞き取り不能）": ""
+}
+```
+
 Longer keys are applied before shorter keys, so phrase-level replacements win over single-character replacements. Regex and context-sensitive rules are intentionally not supported.

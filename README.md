@@ -12,7 +12,7 @@ A real-time dictation tool that transcribes your speech as you speak using Eleve
 - **Floating status indicator**: Small on-screen chip shows recording/finalizing state
 - **Auto-paste**: Transcribed text is automatically pasted at your cursor position
 - **Low latency**: ~150ms transcription delay using Scribe v2 Realtime
-- **Chinese punctuation restoration**: Local CT-Punc model adds punctuation for Chinese transcripts
+- **Model-native punctuation**: Scribe v2 Realtime returns punctuated transcripts directly
 - **Sound feedback**: Audio cues when recording starts/stops
 - **Clipboard preservation**: Your clipboard contents are restored after pasting
 
@@ -167,10 +167,6 @@ uv sync
 - Scribe v2 Realtime requires a stable connection
 - Lower audio quality environments may need longer processing
 
-### Startup takes longer on first run
-
-- The app loads a local Chinese punctuation model (`ct-punc`) at startup
-- The first run may download model files; later runs should be faster
 
 ### Terminal shows escape sequences when pressing hotkey
 
@@ -196,7 +192,7 @@ If you see characters like `[8706;7u` in your terminal when pressing the hotkey,
 - **Hotkey interception**: QuickMacHotKey for global hotkey detection and consumption
 - **Audio capture**: PyAudio for real-time microphone recording (16kHz PCM)
 - **Transcription**: ElevenLabs Scribe v2 Realtime WebSocket API
-- **Chinese punctuation**: Local FunASR CT-Punc model (`ct-punc`)
+- **Punctuation**: Provided directly by ElevenLabs Scribe v2 Realtime
 - **Text insertion**: Clipboard paste via `pyperclip` + `pynput` (Cmd+V simulation)
 - **Async I/O**: `asyncio` for concurrent audio streaming and transcription
 - **Event loop**: NSApplication event loop with asyncio running in separate thread
