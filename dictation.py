@@ -35,11 +35,11 @@ from AppKit import (
     NSEventModifierFlagShift,
     NSFont,
     NSFontAttributeName,
-    NSLineBreakByTruncatingHead,
+    NSLineBreakByWordWrapping,
     NSPanel,
     NSScreen,
     NSStatusWindowLevel,
-    NSTextAlignmentRight,
+    NSTextAlignmentLeft,
     NSTextField,
     NSView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -61,11 +61,6 @@ from elevenlabs.realtime.connection import RealtimeConnection
 from Foundation import NSAttributedString, NSMakeRect, NSObject
 from pynput.keyboard import Controller, Key
 from PyObjCTools import AppHelper
-from Quartz import (
-    CABasicAnimation,
-    CAMediaTimingFunction,
-    kCAMediaTimingFunctionEaseInEaseOut,
-)
 
 # QuickMacHotKey for global hotkey interception (blocks keypress from reaching other apps)
 from quickmachotkey import mask, quickHotKey
@@ -259,9 +254,11 @@ def sanitize_for_paste(text: str) -> str:
 class StatusOverlay(NSObject):
     """Always-on-top dictation indicator with live transcript preview.
 
-    Idle sessions show just a pulsing red dot (recording) or orange dot
+    Idle sessions show just a steady red dot (recording) or orange dot
     (finalizing); as partial transcripts stream in, the capsule widens to
-    preview what is being transcribed (newest words stay visible).
+    preview what is being transcribed, then wraps onto more lines. When the
+    text outgrows MAX_LINES, the oldest words are dropped so the newest stay
+    visible.
     """
 
     WIDTH = 30
@@ -270,9 +267,9 @@ class StatusOverlay(NSObject):
     DOT_SIZE = 10
     TEXT_SPACING = 8  # gap between dot and preview text
     TEXT_PADDING_RIGHT = 12
-    MAX_TEXT_WIDTH = 460  # px; older words scroll away (truncated at the head)
+    MAX_TEXT_WIDTH = 460  # px; longer text wraps onto the next line
+    MAX_LINES = 4  # beyond this, older words scroll away (dropped at the head)
     FONT_SIZE = 13
-    PULSE_KEY = "dictationPulse"
 
     def init(self):
         self = objc.super(StatusOverlay, self).init()
@@ -283,7 +280,13 @@ class StatusOverlay(NSObject):
         self.dot_view = None
         self.preview_label = None
         self.preview_font = NSFont.systemFontOfSize_(self.FONT_SIZE)
+        self.line_height = math.ceil(
+            self.preview_font.ascender()
+            - self.preview_font.descender()
+            + self.preview_font.leading()
+        )
         self.text_width = 0
+        self.text_height = 0
         self.screen_frame = None
         self._create_panel()
         return self
@@ -292,6 +295,11 @@ class StatusOverlay(NSObject):
         if self.text_width <= 0:
             return self.WIDTH
         return self.WIDTH + self.text_width + self.TEXT_PADDING_RIGHT
+
+    def _current_height(self) -> float:
+        # One line keeps the original 30px pill; extra lines grow downward.
+        extra = max(0, self.text_height - self.line_height)
+        return self.HEIGHT + extra
 
     def _pick_screen_frame(self):
         """Visible frame of the screen under the mouse (or main screen)."""
@@ -313,14 +321,15 @@ class StatusOverlay(NSObject):
         return screen.visibleFrame() if screen is not None else None
 
     def _screen_rect(self):
-        """Panel rect centered top-of-screen for the current capsule width."""
+        """Panel rect centered top-of-screen for the current capsule size."""
         width = self._current_width()
+        height = self._current_height()
         frame = self.screen_frame
         if frame is None:
-            return NSMakeRect(40, 40, width, self.HEIGHT)
+            return NSMakeRect(40, 40, width, height)
         x = frame.origin.x + (frame.size.width - width) / 2
-        y = frame.origin.y + frame.size.height - self.HEIGHT - self.TOP_MARGIN
-        return NSMakeRect(x, y, width, self.HEIGHT)
+        y = frame.origin.y + frame.size.height - height - self.TOP_MARGIN
+        return NSMakeRect(x, y, width, height)
 
     def _create_panel(self):
         self.screen_frame = self._pick_screen_frame()
@@ -368,26 +377,16 @@ class StatusOverlay(NSObject):
         dot_layer.setBackgroundColor_(NSColor.systemRedColor().CGColor())
         content.addSubview_(self.dot_view)
 
-        line_height = self.preview_font.ascender() - self.preview_font.descender()
-        label_height = math.ceil(line_height) + 2
-        self.preview_label = NSTextField.labelWithString_("")
+        self.preview_label = NSTextField.wrappingLabelWithString_("")
         self.preview_label.setFont_(self.preview_font)
         self.preview_label.setTextColor_(
             NSColor.colorWithCalibratedRed_green_blue_alpha_(
                 0.92, 0.92, 0.94, 0.92
             )
         )
-        self.preview_label.setAlignment_(NSTextAlignmentRight)
-        self.preview_label.setLineBreakMode_(NSLineBreakByTruncatingHead)
-        self.preview_label.setUsesSingleLineMode_(True)
-        self.preview_label.setFrame_(
-            NSMakeRect(
-                self.WIDTH - (self.WIDTH - self.DOT_SIZE) / 2 + self.TEXT_SPACING,
-                (self.HEIGHT - label_height) / 2,
-                0,
-                label_height,
-            )
-        )
+        self.preview_label.setAlignment_(NSTextAlignmentLeft)
+        self.preview_label.setLineBreakMode_(NSLineBreakByWordWrapping)
+        self.preview_label.setMaximumNumberOfLines_(0)
         self.preview_label.setHidden_(True)
         content.addSubview_(self.preview_label)
 
@@ -400,41 +399,67 @@ class StatusOverlay(NSObject):
         if dot_layer:
             dot_layer.setBackgroundColor_(color.CGColor())
 
-    def _set_pulsing(self, pulsing: bool):
-        dot_layer = self.dot_view.layer() if self.dot_view else None
-        if not dot_layer:
-            return
-        if not pulsing:
-            dot_layer.removeAnimationForKey_(self.PULSE_KEY)
-            return
-        if dot_layer.animationForKey_(self.PULSE_KEY) is not None:
-            return
-        pulse = CABasicAnimation.animationWithKeyPath_("opacity")
-        pulse.setFromValue_(1.0)
-        pulse.setToValue_(0.35)
-        pulse.setDuration_(0.8)
-        pulse.setAutoreverses_(True)
-        pulse.setRepeatCount_(float("inf"))
-        pulse.setTimingFunction_(
-            CAMediaTimingFunction.functionWithName_(
-                kCAMediaTimingFunctionEaseInEaseOut
-            )
-        )
-        dot_layer.addAnimation_forKey_(pulse, self.PULSE_KEY)
-
-    def _measure_text_width(self, text: str) -> int:
+    def _single_line_width(self, text: str) -> int:
         attributed = NSAttributedString.alloc().initWithString_attributes_(
             text, {NSFontAttributeName: self.preview_font}
         )
-        return min(math.ceil(attributed.size().width) + 6, self.MAX_TEXT_WIDTH)
+        return math.ceil(attributed.size().width) + 6
+
+    def _wrapped_height(self, text: str, width: float) -> int:
+        """Height the label needs to show text wrapped at width."""
+        self.preview_label.setStringValue_(text)
+        size = self.preview_label.cell().cellSizeForBounds_(
+            NSMakeRect(0, 0, width, 100000)
+        )
+        return math.ceil(size.height)
+
+    def _layout_text(self, text: str) -> str:
+        """Size the label for text; drop the oldest words past MAX_LINES."""
+        width = self._single_line_width(text)
+        if width <= self.MAX_TEXT_WIDTH:
+            self.text_width = width
+            self.text_height = self.line_height
+            return text
+
+        self.text_width = self.MAX_TEXT_WIDTH
+        max_height = self.line_height * self.MAX_LINES
+        if self._wrapped_height(text, self.text_width) <= max_height:
+            self.text_height = self._wrapped_height(text, self.text_width)
+            return text
+
+        # Binary-search the smallest cut that fits, keeping the newest words.
+        low, high = 1, len(text) - 1
+        while low < high:
+            mid = (low + high) // 2
+            if self._wrapped_height("…" + text[mid:], self.text_width) <= max_height:
+                high = mid
+            else:
+                low = mid + 1
+        text = "…" + text[low:]
+        self.text_height = self._wrapped_height(text, self.text_width)
+        return text
 
     def _apply_width(self):
         """Resize the capsule around the preview text (instant, no animation)."""
         if not self.panel:
             return
-        label_frame = self.preview_label.frame()
-        label_frame.size.width = self.text_width
-        self.preview_label.setFrame_(label_frame)
+        height = self._current_height()
+        # Content view is bottom-up: keep the dot on the first line, and the
+        # text block padded the same as a single-line pill.
+        dot_y = height - (self.HEIGHT + self.DOT_SIZE) / 2
+        dot_frame = self.dot_view.frame()
+        dot_frame.origin.y = dot_y
+        self.dot_view.setFrame_(dot_frame)
+
+        padding = (self.HEIGHT - self.line_height) / 2
+        self.preview_label.setFrame_(
+            NSMakeRect(
+                self.WIDTH - (self.WIDTH - self.DOT_SIZE) / 2 + self.TEXT_SPACING,
+                padding,
+                self.text_width,
+                max(self.text_height, 0),
+            )
+        )
         self.preview_label.setHidden_(self.text_width <= 0)
         self.panel.setFrame_display_(self._screen_rect(), True)
 
@@ -446,8 +471,8 @@ class StatusOverlay(NSObject):
         self.screen_frame = self._pick_screen_frame()
         self.preview_label.setStringValue_("")
         self.text_width = 0
+        self.text_height = 0
         self._set_dot_color(NSColor.systemRedColor())
-        self._set_pulsing(True)
         self._apply_width()
         self.panel.orderFrontRegardless()
 
@@ -455,7 +480,6 @@ class StatusOverlay(NSObject):
         if not self.panel:
             return
         self._set_dot_color(NSColor.systemOrangeColor())
-        self._set_pulsing(False)
         self._apply_width()
         self.panel.orderFrontRegardless()
 
@@ -465,8 +489,7 @@ class StatusOverlay(NSObject):
         text = text.replace("\n", " ").strip()
         if not text:
             return
-        self.preview_label.setStringValue_(text)
-        self.text_width = self._measure_text_width(text)
+        self.preview_label.setStringValue_(self._layout_text(text))
         self._apply_width()
 
     def hide(self):
@@ -475,7 +498,7 @@ class StatusOverlay(NSObject):
         if self.preview_label:
             self.preview_label.setStringValue_("")
         self.text_width = 0
-        self._set_pulsing(False)
+        self.text_height = 0
 
 
 def paste_text(text):
