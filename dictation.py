@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import unicodedata
+import urllib.parse
 from queue import Empty, Full, Queue
 from typing import Optional
 
@@ -91,6 +92,29 @@ CHARACTER_REPLACEMENTS_PATH = os.path.join(
 )
 DEFAULT_CHARACTER_REPLACEMENTS = {
     "纔": "才",
+}
+KEYTERMS_PATH = os.path.join(os.path.dirname(__file__), "keyterms.json")
+# Realtime keyterm limits (ElevenLabs docs): max 50 terms, 1000 chars total.
+KEYTERMS_MAX_COUNT = 50
+KEYTERMS_MAX_TOTAL_CHARS = 1000
+
+# Model profiles, picked with --model.
+#   v2: the original setup, kept unchanged as a fallback.
+#   v3: Scribe v3 Live + keyterms.json + OpenCC s2tw (Taiwan characters:
+#       裡/才/啟/著 instead of s2t's 裏/纔/啓/着).
+MODEL_PROFILES = {
+    "v2": {
+        "model_id": "scribe_v2_realtime",
+        "label": "Scribe v2 Realtime",
+        "opencc_config": "s2t",
+        "use_keyterms": False,
+    },
+    "v3": {
+        "model_id": "scribe_v3_live",
+        "label": "Scribe v3 Live",
+        "opencc_config": "s2tw",
+        "use_keyterms": True,
+    },
 }
 TRAILING_STRIP_CHARS = "。"
 TRAILING_CUTOFF_DASH_CHARS = "-–—"
@@ -531,7 +555,8 @@ def paste_text(text):
 
 
 class DictationApp:
-    def __init__(self, chinese="tw"):
+    def __init__(self, chinese="tw", model="v2"):
+        self.profile = MODEL_PROFILES[model]
         self.is_recording = False
         self.audio_stream = None
         self.audio_interface = None
@@ -564,10 +589,13 @@ class DictationApp:
         # s2t: Simplified to Traditional, t2s: Traditional to Simplified
         self.chinese_variant = chinese
         if chinese == "tw":
-            self.chinese_converter = opencc.OpenCC("s2t")
+            self.chinese_converter = opencc.OpenCC(self.profile["opencc_config"])
         else:
             self.chinese_converter = opencc.OpenCC("t2s")
         self.character_replacement_items = self._load_character_replacements()
+        self.keyterms = (
+            self._load_keyterms() if self.profile["use_keyterms"] else []
+        )
 
         # Initialize ElevenLabs client
         elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
@@ -588,6 +616,10 @@ class DictationApp:
         self.audio_stream = None
 
         print("Dictation App Ready!")
+        print(
+            f"Model: {self.profile['label']} ({self.profile['model_id']}), "
+            f"OpenCC: {self.profile['opencc_config']}, keyterms: {len(self.keyterms)}"
+        )
         print(
             f"Chinese output: {'Traditional (TW)' if chinese == 'tw' else 'Simplified (CN)'}"
         )
@@ -649,6 +681,43 @@ class DictationApp:
         )
         print(f"🔤 Character replacements loaded: {len(replacement_items)}")
         return replacement_items
+
+    def _load_keyterms(self) -> list[str]:
+        """Load keyterms.json (a JSON list of strings) within realtime limits."""
+        try:
+            with open(KEYTERMS_PATH, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            if not isinstance(loaded, list) or not all(
+                isinstance(term, str) for term in loaded
+            ):
+                raise ValueError("keyterms.json must be a JSON list of strings")
+        except FileNotFoundError:
+            print("⚠️  keyterms.json not found; running without keyterms")
+            return []
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            print(f"⚠️  Failed to load keyterms.json ({e}); running without keyterms")
+            return []
+
+        terms: list[str] = []
+        total_chars = 0
+        for term in (t.strip() for t in loaded):
+            if not term or term in terms:
+                continue
+            if (
+                len(terms) >= KEYTERMS_MAX_COUNT
+                or total_chars + len(term) > KEYTERMS_MAX_TOTAL_CHARS
+            ):
+                print(
+                    f"⚠️  keyterms.json over the realtime limit "
+                    f"({KEYTERMS_MAX_COUNT} terms / {KEYTERMS_MAX_TOTAL_CHARS} chars); "
+                    f"ignoring from '{term}' on"
+                )
+                break
+            terms.append(term)
+            total_chars += len(term)
+
+        print(f"🎯 Keyterms loaded: {len(terms)} ({total_chars} chars)")
+        return terms
 
     def apply_character_replacements(self, text: str) -> str:
         """Apply literal character replacements using longest match first.
@@ -792,23 +861,25 @@ class DictationApp:
                     "Realtime client unavailable in current ElevenLabs SDK"
                 )
 
-            if not getattr(realtime_client, "_dictation_no_verbatim_patch", False):
+            if not getattr(realtime_client, "_dictation_url_patch", False):
                 original_build_websocket_url = realtime_client._build_websocket_url
+                # SDK 2.45 has no options for these, so append them to the URL.
+                extra_query = [("no_verbatim", "true")] + [
+                    ("keyterms", term) for term in self.keyterms
+                ]
 
-                def build_websocket_url_with_no_verbatim(*args, **kwargs):
+                def build_websocket_url_with_extras(*args, **kwargs):
                     url = original_build_websocket_url(*args, **kwargs)
                     separator = "&" if "?" in url else "?"
-                    return f"{url}{separator}no_verbatim=true"
+                    return f"{url}{separator}{urllib.parse.urlencode(extra_query)}"
 
-                realtime_client._build_websocket_url = (
-                    build_websocket_url_with_no_verbatim
-                )
-                realtime_client._dictation_no_verbatim_patch = True
+                realtime_client._build_websocket_url = build_websocket_url_with_extras
+                realtime_client._dictation_url_patch = True
 
             connect_task = asyncio.create_task(
                 realtime_client.connect(
                     RealtimeAudioOptions(
-                        model_id="scribe_v2_realtime",
+                        model_id=self.profile["model_id"],
                         audio_format=AudioFormat.PCM_16000,
                         sample_rate=SAMPLE_RATE,
                         commit_strategy=CommitStrategy.MANUAL,
@@ -1216,7 +1287,7 @@ class DictationApp:
         self.session_started_sessions.add(session_id)
         if session_id != self.active_session_id:
             return
-        print("🔌 Connected to ElevenLabs Scribe v2 Realtime")
+        print(f"🔌 Connected to ElevenLabs {self.profile['label']}")
 
     def on_partial_transcript(self, data, session_id):
         """Called when partial transcript is received"""
@@ -1418,7 +1489,7 @@ class AppDelegate(NSObject):
         print("Press Ctrl+C to exit.\n")
 
 
-def setup_async_loop(chinese):
+def setup_async_loop(chinese, model):
     """Set up the async event loop in a separate thread."""
     global app, event_loop
 
@@ -1428,7 +1499,7 @@ def setup_async_loop(chinese):
     event_loop = loop
 
     # Create app instance
-    app = DictationApp(chinese=chinese)
+    app = DictationApp(chinese=chinese, model=model)
 
     # Signal that initialization is complete
     async_loop_ready.set()
@@ -1437,7 +1508,7 @@ def setup_async_loop(chinese):
     loop.run_forever()
 
 
-def start_app(chinese="tw", enable_right_shift_ptt=True):
+def start_app(chinese="tw", enable_right_shift_ptt=True, model="v2"):
     """Start the application with NSApplication event loop."""
     global right_shift_ptt_enabled, right_shift_ptt_monitor
 
@@ -1446,7 +1517,7 @@ def start_app(chinese="tw", enable_right_shift_ptt=True):
 
     # Start asyncio event loop in a separate thread
     async_thread = threading.Thread(
-        target=setup_async_loop, args=(chinese,), daemon=True
+        target=setup_async_loop, args=(chinese, model), daemon=True
     )
     async_thread.start()
 
@@ -1495,8 +1566,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable hold-to-talk on Right Shift (Cmd+Option+Control+D toggle stays enabled)",
     )
+    parser.add_argument(
+        "--model",
+        choices=sorted(MODEL_PROFILES),
+        default="v2",
+        help="v2 = Scribe v2 Realtime (original); v3 = Scribe v3 Live + keyterms.json + OpenCC s2tw",
+    )
     args = parser.parse_args()
     start_app(
         chinese=args.chinese,
         enable_right_shift_ptt=not args.disable_right_shift_ptt,
+        model=args.model,
     )
