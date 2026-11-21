@@ -555,7 +555,7 @@ def paste_text(text):
 
 
 class DictationApp:
-    def __init__(self, chinese="tw", model="v2"):
+    def __init__(self, chinese="tw", model="v3"):
         self.profile = MODEL_PROFILES[model]
         self.is_recording = False
         self.audio_stream = None
@@ -1508,7 +1508,7 @@ def setup_async_loop(chinese, model):
     loop.run_forever()
 
 
-def start_app(chinese="tw", enable_right_shift_ptt=True, model="v2"):
+def start_app(chinese="tw", enable_right_shift_ptt=True, model="v3"):
     """Start the application with NSApplication event loop."""
     global right_shift_ptt_enabled, right_shift_ptt_monitor
 
@@ -1569,8 +1569,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         choices=sorted(MODEL_PROFILES),
-        default="v2",
-        help="v2 = Scribe v2 Realtime (original); v3 = Scribe v3 Live + keyterms.json + OpenCC s2tw",
+        default="v3",
+        help="v3 (default) = Scribe v3 Live + keyterms.json + OpenCC s2tw; v2 = Scribe v2 Realtime (old setup)",
     )
     args = parser.parse_args()
     start_app(
