@@ -71,6 +71,7 @@ from quickmachotkey.constants import (
     kVK_ANSI_D,
     kVK_RightShift,
     optionKey,
+    shiftKey,
 )
 
 # Load environment variables
@@ -130,10 +131,36 @@ SOUND_STOP = "/System/Library/Sounds/Tink.aiff"  # Sound when recording stops
 SOUND_START_VOLUME = 0.25
 SOUND_STOP_VOLUME = 0.25
 
+# Live preview on/off. Shared by v2 and v3 and kept across restarts.
+SETTINGS_PATH = os.path.expanduser(
+    "~/Library/Application Support/Dictation-App-11lab/settings.json"
+)
+NOTICE_SECONDS = 1.4  # how long the "預覽 開/關" capsule stays up
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(settings: dict):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as file:
+            json.dump(settings, file, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"⚠️  Could not save settings: {e}")
+
+
 # Global state
 event_loop = None  # Store reference to the event loop
 async_loop_ready = threading.Event()  # Signals when async loop is initialized
 status_overlay = None
+live_preview_enabled = bool(load_settings().get("live_preview", True))
 
 
 def play_sound(sound_path, volume=0.25):
@@ -312,6 +339,10 @@ class StatusOverlay(NSObject):
         self.text_width = 0
         self.text_height = 0
         self.screen_frame = None
+        self.mode = "hidden"  # hidden / recording / finalizing
+        self.preview_text = ""  # latest partial, kept even while preview is off
+        self.notice_token = 0
+        self.notice_active = False
         self._create_panel()
         return self
 
@@ -487,25 +518,48 @@ class StatusOverlay(NSObject):
         self.preview_label.setHidden_(self.text_width <= 0)
         self.panel.setFrame_display_(self._screen_rect(), True)
 
+    def _set_text(self, text: str):
+        """Show text in the capsule, or collapse to just the dot when empty."""
+        if text:
+            self.preview_label.setStringValue_(self._layout_text(text))
+        else:
+            self.preview_label.setStringValue_("")
+            self.text_width = 0
+            self.text_height = 0
+        self._apply_width()
+
+    def _render_session(self):
+        """Redraw the recording/finalizing view from the current state."""
+        color = (
+            NSColor.systemOrangeColor()
+            if self.mode == "finalizing"
+            else NSColor.systemRedColor()
+        )
+        self._set_dot_color(color)
+        self._set_text(self.preview_text if live_preview_enabled else "")
+        self.panel.orderFrontRegardless()
+
+    def _cancel_notice(self):
+        self.notice_token += 1
+        self.notice_active = False
+
     def show_recording(self):
         if not self.panel:
             return
+        self._cancel_notice()
         # Pick the screen once per session so the capsule doesn't jump
         # between displays while the mouse moves.
         self.screen_frame = self._pick_screen_frame()
-        self.preview_label.setStringValue_("")
-        self.text_width = 0
-        self.text_height = 0
-        self._set_dot_color(NSColor.systemRedColor())
-        self._apply_width()
-        self.panel.orderFrontRegardless()
+        self.mode = "recording"
+        self.preview_text = ""
+        self._render_session()
 
     def show_finalizing(self):
         if not self.panel:
             return
-        self._set_dot_color(NSColor.systemOrangeColor())
-        self._apply_width()
-        self.panel.orderFrontRegardless()
+        self.mode = "finalizing"
+        if not self.notice_active:
+            self._render_session()
 
     def show_partial(self, text: str):
         if not self.panel:
@@ -513,10 +567,38 @@ class StatusOverlay(NSObject):
         text = text.replace("\n", " ").strip()
         if not text:
             return
-        self.preview_label.setStringValue_(self._layout_text(text))
-        self._apply_width()
+        self.preview_text = text
+        if live_preview_enabled and not self.notice_active:
+            self._set_text(text)
+
+    def show_notice(self, text: str):
+        """Briefly show a message (e.g. preview toggled), then go back."""
+        if not self.panel:
+            return
+        self.notice_token += 1
+        token = self.notice_token
+        self.notice_active = True
+        if self.mode == "hidden":
+            self.screen_frame = self._pick_screen_frame()
+        self._set_dot_color(NSColor.systemBlueColor())
+        self._set_text(text)
+        self.panel.orderFrontRegardless()
+        AppHelper.callLater(NOTICE_SECONDS, self._end_notice, token)
+
+    def _end_notice(self, token: int):
+        if token != self.notice_token:
+            return  # a newer notice or a new recording took over
+        self.notice_active = False
+        if self.mode == "hidden":
+            self.hide()
+        else:
+            self._render_session()
 
     def hide(self):
+        self.mode = "hidden"
+        self.preview_text = ""
+        if self.notice_active:
+            return  # let the notice finish; _end_notice hides afterwards
         if self.panel:
             self.panel.orderOut_(None)
         if self.preview_label:
@@ -1469,6 +1551,33 @@ def handle_hotkey():
             asyncio.run_coroutine_threadsafe(app.stop_recording(), event_loop)
 
 
+def toggle_live_preview():
+    """Flip live preview on/off, save it, and show a short notice."""
+    global live_preview_enabled
+    live_preview_enabled = not live_preview_enabled
+    settings = load_settings()
+    settings["live_preview"] = live_preview_enabled
+    save_settings(settings)
+    state = "on" if live_preview_enabled else "off"
+    print(f"👁️  Live preview {state}")
+    play_sound(SOUND_START if live_preview_enabled else SOUND_STOP, 0.15)
+    if status_overlay:
+        status_overlay.show_notice(
+            "即時預覽：開" if live_preview_enabled else "即時預覽：關"
+        )
+
+
+# Hyper (Cmd+Option+Control) + Shift + D: toggle live preview.
+@quickHotKey(
+    virtualKey=kVK_ANSI_D, modifierMask=mask(cmdKey, controlKey, optionKey, shiftKey)
+)
+def handle_preview_hotkey():
+    try:
+        toggle_live_preview()
+    except Exception as e:
+        print(f"⚠️  Live preview toggle error: {e}")
+
+
 class AppDelegate(NSObject):
     """Simple app delegate for NSApplication."""
 
@@ -1483,6 +1592,10 @@ class AppDelegate(NSObject):
             right_shift_ptt_monitor.start()
 
         print("Hotkey monitor started. Press Cmd+Option+Control+D to toggle recording.")
+        print(
+            "Press Cmd+Option+Control+Shift+D to toggle live preview "
+            f"(now {'on' if live_preview_enabled else 'off'})."
+        )
         if right_shift_ptt_enabled:
             print("Hold Right Shift for push-to-talk.")
         print("(QuickMacHotKey will intercept the keypress - terminal won't see it)")
