@@ -264,6 +264,105 @@ def strip_trailing_final_punctuation(text: str) -> str:
     return stripped
 
 
+CJK_CHAR_RE = re.compile(r"[㐀-鿿豈-﫿぀-ヿ]")
+LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
+LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’-]*")
+FULL_TO_HALF_PUNCT = {"，": ",", "。": ".", "？": "?", "！": "!", "；": ";", "：": ":"}
+HALF_TO_FULL_PUNCT = {",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "："}
+SENTENCE_END_FULL = "。？！"
+SENTENCE_END_HALF = ".?!"
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    """Split into sentences: after 。？！ / newline, or after .?! followed by space or end."""
+    spans = []
+    start = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        boundary = c in SENTENCE_END_FULL or c == "\n" or (
+            c in SENTENCE_END_HALF and (i + 1 == n or text[i + 1].isspace())
+        )
+        if boundary:
+            j = i + 1
+            while j < n and text[j] in SENTENCE_END_FULL + SENTENCE_END_HALF:
+                j += 1
+            spans.append((start, j))
+            start = i = j
+        else:
+            i += 1
+    if start < n:
+        spans.append((start, n))
+    return spans
+
+
+def _half_mark_belongs_to_chinese(text: str, k: int) -> bool:
+    """Should the half-width mark at k become full-width (it sits in a Chinese sentence)?"""
+    c = text[k]
+    j = k + 1
+    while j < len(text) and text[j] == " ":
+        j += 1
+    nxt = text[j] if j < len(text) else ""
+    next_is_cjk = bool(nxt) and bool(CJK_CHAR_RE.match(nxt))
+    if c in ".?!":
+        # A whole English clause ending here ("上面—— Your agent needs your input. 上面有…")
+        # keeps its own mark; a word or two inside Chinese ("變成 DGX?") gets the Chinese one.
+        before = text[:k]
+        last_cjk = max((m.end() for m in CJK_CHAR_RE.finditer(before)), default=0)
+        if len(LATIN_WORD_RE.findall(before[last_cjk:])) >= 3:
+            return False
+        if c == ".":
+            return next_is_cjk  # keeps 3.5, Node.js
+        return next_is_cjk or not nxt
+    # , ; : only when Chinese follows: keeps 10:30 and "DGX, Spark" as they are
+    return next_is_cjk
+
+
+def normalize_mixed_punctuation(text: str) -> str:
+    """English sentences get English punctuation, Chinese sentences get Chinese punctuation.
+
+    Scribe picks the punctuation style per stretch of speech, so a short English sentence said
+    between Chinese ones comes back as "Yeah，as expected，which is a good thing". The language is
+    decided per sentence, not per word: a Chinese sentence that contains English words
+    ("我剛剛選擇 GitHub Mobile，然後…") keeps its full-width marks.
+      * sentence with Latin letters and no CJK: ，。？！；： -> , . ? ! ; : (plus a space before the next word)
+      * sentence with CJK: , ; : . -> full-width when Chinese follows; ? ! -> full-width at the end too
+    """
+    if not text:
+        return text
+    english_at = [False] * len(text)
+    chinese_at = [False] * len(text)
+    for s, e in _sentence_spans(text):
+        segment = text[s:e]
+        has_cjk = bool(CJK_CHAR_RE.search(segment))
+        is_english = not has_cjk and bool(LATIN_CHAR_RE.search(segment))
+        for k in range(s, e):
+            english_at[k] = is_english
+            chinese_at[k] = has_cjk
+
+    out: list[str] = []
+    skip_spaces = False
+    for k, c in enumerate(text):
+        if skip_spaces:
+            if c == " ":
+                continue
+            skip_spaces = False
+        nxt = text[k + 1] if k + 1 < len(text) else ""
+        if english_at[k] and c in FULL_TO_HALF_PUNCT:
+            out.append(FULL_TO_HALF_PUNCT[c])
+            if nxt and not nxt.isspace() and nxt not in FULL_TO_HALF_PUNCT and nxt not in HALF_TO_FULL_PUNCT:
+                out.append(" ")
+        elif chinese_at[k] and c in HALF_TO_FULL_PUNCT and _half_mark_belongs_to_chinese(text, k):
+            while out and out[-1] == " ":
+                out.pop()
+            out.append(HALF_TO_FULL_PUNCT[c])
+            skip_spaces = True
+        else:
+            out.append(c)
+    return "".join(out)
+
+
 def sanitize_for_paste(text: str) -> str:
     """Remove damaged Unicode and invisible/control characters before paste."""
     sanitized_chars = []
@@ -1305,6 +1404,13 @@ class DictationApp:
                 session_id, "after.character_replacements", converted_text
             )
 
+            # Step 2b: English sentences get English punctuation, Chinese ones Chinese.
+            normalized_text = normalize_mixed_punctuation(converted_text)
+            if normalized_text != converted_text:
+                print("🔣 Normalized mixed-language punctuation")
+            converted_text = normalized_text
+            log_transcript_stage(session_id, "after.punctuation", converted_text)
+
             # Step 3: Remove dictation cutoff artifacts.
             stripped_text = strip_trailing_final_punctuation(converted_text)
             if stripped_text != converted_text:
@@ -1389,6 +1495,7 @@ class DictationApp:
             preview_text = self.chinese_converter.convert(new_text)
             for source, target in self.character_replacement_items:
                 preview_text = preview_text.replace(source, target)
+            preview_text = normalize_mixed_punctuation(preview_text)
         except Exception:
             preview_text = new_text
         set_overlay_partial(preview_text)
