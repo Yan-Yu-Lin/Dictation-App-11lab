@@ -334,12 +334,14 @@ def main():
                 return False
             return True
 
-        GLib.unix_fd_add_full(
-            GLib.PRIORITY_DEFAULT,
-            fd,
-            GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
-            on_stdin,
-        )
+        conditions = GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR
+        try:  # PyGObject >= 3.50 moved this to GLibUnix
+            gi.require_version("GLibUnix", "2.0")
+            from gi.repository import GLibUnix
+
+            GLibUnix.fd_add_full(GLib.PRIORITY_DEFAULT, fd, conditions, on_stdin)
+        except (ImportError, ValueError):
+            GLib.unix_fd_add_full(GLib.PRIORITY_DEFAULT, fd, conditions, on_stdin)
 
     app.connect("activate", on_activate)
     app.run(None)
