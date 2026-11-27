@@ -131,14 +131,21 @@ async def r3():
     await settle(app)
     check("in-flight auto-commit does not end the wait", pasted == ["earlier auto-commit, real tail"], pasted)
 
-    # Held pieces + a final tail that arrives late (after the normal wait): still one paste.
+    # Held pieces + a final tail that arrives late (3 s): included, one paste.
     pasted.clear()
-    old = dictation.FINAL_TRANSCRIPT_TIMEOUT_SECONDS
-    dictation.FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 0.3
-    await live_session(app, [(0.6, "last words")], held=["First words——"])
+    await live_session(app, [(3.0, "last words")], held=["First words——"])
+    await settle(app, limit=15)
+    check("slow tail is kept, still one paste", pasted == ["First words last words"], pasted)
+
+    # The answer never comes (connection dead): the held pieces are still pasted, once.
+    pasted.clear()
+    old = dictation.FINAL_TRANSCRIPT_MAX_SECONDS
+    dictation.FINAL_TRANSCRIPT_MAX_SECONDS = 0.5
+    await live_session(app, [(2.0, "too late")], held=["held piece"])
     await settle(app)
-    dictation.FINAL_TRANSCRIPT_TIMEOUT_SECONDS = old
-    check("late tail never makes a second paste", len(pasted) == 1, pasted)
+    await asyncio.sleep(2.0)  # the answer arrives after the session is closed
+    dictation.FINAL_TRANSCRIPT_MAX_SECONDS = old
+    check("no answer: held text pasted once, late answer ignored", pasted == ["held piece"], pasted)
 
     # Short recording, no auto-commit risk: ends right after the one answer.
     pasted.clear()
@@ -275,12 +282,14 @@ def media():
 
     # R7: a failed Pause is not owned, so a manual pause later is not undone.
     bus.fail_pause.add(A)
+    mark = len(bus.calls)
     p.set_recording(True)
     time.sleep(0.2); wait_idle(p)
     bus.states[A] = "Paused"  # you paused it yourself during the recording
     p.set_recording(False)
     time.sleep(0.2); wait_idle(p)
-    check("failed Pause is not owned (manual pause kept)", bus.states[A] == "Paused" and ("org.mpris.MediaPlayer2.a", "Play") not in bus.calls[-2:], bus.calls[-3:])
+    later = bus.calls[mark:]
+    check("failed Pause is not owned (manual pause kept)", bus.states[A] == "Paused" and (A, "Play") not in later and p.owned == [], later)
     bus.fail_pause.clear()
 
     # R5: Play fails once -> ownership kept and retried, then succeeds.

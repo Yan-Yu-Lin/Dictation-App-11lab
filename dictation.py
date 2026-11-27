@@ -66,6 +66,9 @@ CHANNELS = 1  # Mono
 MAX_AUDIO_QUEUE_CHUNKS = 120  # ~30s of buffered audio at CHUNK_SIZE=4096
 CONNECT_TIMEOUT_SECONDS = 8.0
 FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
+# Scribe answers every commit, so a slow answer is still worth waiting for:
+# giving up drops the end of what you said. This is the hard limit.
+FINAL_TRANSCRIPT_MAX_SECONDS = 8.0
 # Scribe Live commits by itself after ~35 s of uncommitted audio. If at least this
 # much was uncommitted when you stopped, an auto-commit may still be on its way,
 # so the stop waits for one more answer (the first one might be that auto-commit).
@@ -1700,29 +1703,35 @@ class DictationApp:
         Scribe answers every manual commit with one committed_transcript, and also
         commits by itself after ~35 s of uncommitted audio. If enough audio was
         uncommitted that such an auto-commit may be in flight, the first answer
-        after our commit could be that auto-commit, so we wait for one more.
+        after our commit could be that auto-commit, so we also wait a little for
+        a second one.
         """
         signal_event = asyncio.Event()
         self.commit_signal[sid] = signal_event
+        base = self.commit_counts.get(sid, 0)
         risky = self.uncommitted_seconds.get(sid, 0.0) >= AUTO_COMMIT_RISK_SECONDS
-        target = self.commit_counts.get(sid, 0) + (2 if risky else 1)
         await connection.commit()
-        deadline = time.monotonic() + FINAL_TRANSCRIPT_TIMEOUT_SECONDS + (
-            FINAL_TRANSCRIPT_TIMEOUT_SECONDS if risky else 0
-        )
-        while self.commit_counts.get(sid, 0) < target:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if risky and self.commit_counts.get(sid, 0) == target - 1:
-                    # The extra answer never came: there was no auto-commit in flight.
+
+        async def wait_for_count(count: int, seconds: float) -> bool:
+            deadline = time.monotonic() + seconds
+            while self.commit_counts.get(sid, 0) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                signal_event.clear()
+                if self.commit_counts.get(sid, 0) >= count:
                     break
-                print("⚠️  Final transcript event timed out; closing session")
-                break
-            signal_event.clear()
-            try:
-                await asyncio.wait_for(signal_event.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                pass
+                try:
+                    await asyncio.wait_for(signal_event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
+            return True
+
+        if not await wait_for_count(base + 1, FINAL_TRANSCRIPT_MAX_SECONDS):
+            print("⚠️  Final transcript event timed out; closing session")
+            return
+        if risky and not await wait_for_count(base + 2, FINAL_TRANSCRIPT_TIMEOUT_SECONDS):
+            pass  # no auto-commit was in flight: the one answer was ours
 
     def _forget_session(self, session_id: int):
         """Drop a finished session's bookkeeping and hide the overlay if it is idle."""
