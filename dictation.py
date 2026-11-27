@@ -380,6 +380,34 @@ def normalize_mixed_punctuation(text: str) -> str:
     return "".join(out)
 
 
+def join_live_segments(segments: list[str]) -> str:
+    """Join the pieces Scribe Live committed during one recording into one text.
+
+    A long live recording comes back in several pieces, because Scribe commits
+    on its own about every 35 s. A piece that was cut mid-sentence ends with a
+    dash marker; the marker is dropped. A space is added only where an English
+    word meets the next word, the way Scribe spaces text inside one piece.
+    """
+    joined = ""
+    for segment in segments:
+        segment = segment.strip()
+        if not segment:
+            continue
+        joined = joined.rstrip(TRAILING_CUTOFF_DASH_CHARS).rstrip()
+        if not joined:
+            joined = segment
+            continue
+        prev, nxt = joined[-1], segment[0]
+        prev_latin = prev.isascii() and (prev.isalnum() or prev in ".,?!;:")
+        next_latin = nxt.isascii() and nxt.isalnum()
+        prev_cjk = bool(CJK_CHAR_RE.match(prev))
+        next_cjk = bool(CJK_CHAR_RE.match(nxt))
+        if (prev_latin and (next_latin or next_cjk)) or (prev_cjk and next_latin):
+            joined += " "
+        joined += segment
+    return joined
+
+
 def sanitize_for_paste(text: str) -> str:
     """Remove damaged Unicode and invisible/control characters before paste."""
     sanitized_chars = []
@@ -758,6 +786,9 @@ class DictationApp:
         self.mode = mode  # "live" or "batch"; read when a recording starts
         self.batch_sessions: set[int] = set()  # sessions recorded in batch mode
         self.batch_tail: Optional[asyncio.Task] = None  # newest batch job (paste order)
+        # Live mode: text Scribe committed while still recording, pasted at stop.
+        self.live_segments: dict[int, list[str]] = {}
+        self.paste_tasks: set[asyncio.Task] = set()
         self.is_recording = False
         self.audio_stream = None
         self.audio_interface = None
@@ -1404,9 +1435,21 @@ class DictationApp:
                                 "⚠️  Final transcript event timed out; closing session"
                             )
 
+                except Exception as e:
+                    print(f"⚠️  Error finalizing transcript: {e}")
+
+            # Paste the whole recording in one go: the pieces Scribe committed
+            # on its own while you were still talking, plus the final piece.
+            self._paste_held_segments(session_to_cleanup)
+
+            if connection:
+                try:
                     await connection.close()
                 except Exception as e:
                     print(f"⚠️  Error closing connection: {e}")
+                # A final piece that came in late (after the wait above timed
+                # out) is still pasted instead of being thrown away.
+                self._paste_held_segments(session_to_cleanup)
 
             print("✅ Transcription complete!\n")
         except Exception as e:
@@ -1417,6 +1460,19 @@ class DictationApp:
             if self.cleanup_task is asyncio.current_task():
                 self.cleanup_task = None
 
+    def _paste_held_segments(self, session_id: int):
+        """Paste everything a live session has committed so far, as one text."""
+        segments = self.live_segments.pop(session_id, [])
+        if not segments:
+            return
+        if len(segments) > 1:
+            print(f"🧩 Joining {len(segments)} pieces (session {session_id})")
+        paste_task = asyncio.create_task(
+            self._process_final_transcript(join_live_segments(segments), session_id)
+        )
+        self.paste_tasks.add(paste_task)
+        paste_task.add_done_callback(self.paste_tasks.discard)
+
     def _forget_session(self, session_id: int):
         """Drop a finished session's bookkeeping and hide the overlay if it is idle."""
         self.commit_events.pop(session_id, None)
@@ -1426,6 +1482,7 @@ class DictationApp:
         self.registered_connection_sessions.discard(session_id)
         self.session_started_sessions.discard(session_id)
         self.batch_sessions.discard(session_id)
+        self.live_segments.pop(session_id, None)
         self.audio_callback_counts.pop(session_id, None)
         self.audio_drop_counts.pop(session_id, None)
         self.sender_chunk_counts.pop(session_id, None)
@@ -1643,6 +1700,9 @@ class DictationApp:
         self.last_partial_text = new_text
         print(f"📝 Processing: {new_text}")
         try:
+            held = self.live_segments.get(session_id)
+            if held:
+                new_text = join_live_segments([*held, new_text])
             preview_text = self.chinese_converter.convert(new_text)
             for source, target in self.character_replacement_items:
                 preview_text = preview_text.replace(source, target)
@@ -1652,36 +1712,47 @@ class DictationApp:
         set_overlay_partial(preview_text)
 
     def on_committed_transcript(self, data, session_id):
-        """Called when final transcript is committed"""
-        commit_event = self.commit_events.get(session_id)
-        if commit_event and event_loop:
-            event_loop.call_soon_threadsafe(commit_event.set)
+        """Called when Scribe commits a piece of the transcript.
 
-        if session_id not in self.commit_events:
-            return
-
-        final_text = data.get("text", "").strip()
-        if not final_text:
-            return
-
-        log_transcript_stage(session_id, "event.committed", final_text)
-
-        # Deduplicate rapid repeated committed events for the same segment.
-        # Keep only near-identical repeats, allow same text later in long sessions.
-        now = time.monotonic()
-        last_committed = self.last_committed_text_by_session.get(session_id)
-        if last_committed:
-            last_text, last_time = last_committed
-            if last_text == final_text and (now - last_time) < 1.5:
-                log_transcript_stage(session_id, "dedupe.skip", final_text)
+        Nothing is pasted here. Scribe Live commits on its own about every 35 s
+        of a long recording; pasting those pieces right away put text into
+        whatever app had focus mid-speech. Pieces are held and pasted together
+        when the recording stops (see _cleanup_session).
+        """
+        try:
+            if session_id not in self.commit_events:
                 return
-        self.last_committed_text_by_session[session_id] = (final_text, now)
 
-        if event_loop:
-            # Schedule async processing (OpenCC + replacements + paste)
-            asyncio.run_coroutine_threadsafe(
-                self._process_final_transcript(final_text, session_id), event_loop
-            )
+            final_text = data.get("text", "").strip()
+            if not final_text:
+                return
+
+            log_transcript_stage(session_id, "event.committed", final_text)
+
+            # Deduplicate rapid repeated committed events for the same segment.
+            # Keep only near-identical repeats, allow same text later in long sessions.
+            now = time.monotonic()
+            last_committed = self.last_committed_text_by_session.get(session_id)
+            if last_committed:
+                last_text, last_time = last_committed
+                if last_text == final_text and (now - last_time) < 1.5:
+                    log_transcript_stage(session_id, "dedupe.skip", final_text)
+                    return
+            self.last_committed_text_by_session[session_id] = (final_text, now)
+
+            segments = self.live_segments.setdefault(session_id, [])
+            segments.append(final_text)
+            if session_id not in self.stopping_sessions:
+                print(
+                    f"⏸️  Holding piece {len(segments)} until you stop "
+                    f"(session {session_id})"
+                )
+        finally:
+            # Wake the stop path only after the text is stored, so the final
+            # piece is always part of the paste.
+            commit_event = self.commit_events.get(session_id)
+            if commit_event and event_loop:
+                event_loop.call_soon_threadsafe(commit_event.set)
 
     def on_error(self, error, session_id):
         """Called when an error occurs"""

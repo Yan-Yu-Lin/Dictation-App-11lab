@@ -90,6 +90,7 @@ python dictation.py
 ### Live vs batch mode
 
 - **live** (default): audio is streamed to Scribe Live (`scribe_v3_live`) while you speak. Text comes back about 0.2 s after you stop, and the live preview works.
+  Nothing is pasted until you stop. On a long recording Scribe Live commits text on its own about every 35 s; those pieces are held and pasted together as one text when you stop. A piece that Scribe cut mid-sentence can leave a stray 「。」 at the cut point; batch mode has no cut points.
 - **batch**: the recording stays in memory and is sent in one request (`scribe_v3`) when you stop. No live preview; text comes back about 0.5–1.5 s after you stop (longer recordings take longer). If the request fails it is retried once; if it still fails nothing is pasted and the dot shows 「轉錄失敗」.
 
 Switch with **Cmd+Option+Control+Shift+M** (Hyper+Shift+M). The choice is saved and used on the next start. `--mode live` / `--mode batch` forces a mode for one run:
@@ -103,6 +104,7 @@ Both modes use the same keyterms, OpenCC conversion, replacements and clean-up. 
 ```bash
 uv run python eval/mode_check.py                # TTS sentences
 uv run python eval/mode_check.py --wav my.m4a   # your own recording
+uv run python eval/mode_check.py --long         # ~100 s live recording: one paste, at stop
 ```
 
 ### Controls
