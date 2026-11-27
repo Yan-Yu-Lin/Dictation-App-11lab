@@ -155,7 +155,7 @@ async def r3():
     await live_session(app, [(2.5, "a"), (0.2, "b"), (1.0, "c")], audio_seconds=60)
     await settle(app, limit=15)
     conn = app.last_connection
-    check("60 s: 3 commits, every answer kept, in order", conn.commits == 3 and pasted == ["abc"], (conn.commits, pasted))
+    check("60 s: 3 commits, every answer kept, in order", conn.commits == 3 and pasted == ["a b c"], (conn.commits, pasted))
 
     # The stop always sends >= 0.3 s of padding before its commit (no commit_throttled).
     pasted.clear()
