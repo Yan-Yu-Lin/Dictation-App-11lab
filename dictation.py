@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Dictation app using ElevenLabs Scribe v2 Realtime.
+Dictation app using ElevenLabs Scribe.
 Press hotkey to start/stop recording, text is pasted when you finish speaking.
+
+Two ways to transcribe, picked with --mode or Hyper+Shift+M:
+  live  : audio is streamed over a WebSocket while you speak (Scribe Live).
+  batch : audio is kept in memory and sent in one request when you stop.
 """
 
 import argparse
@@ -69,6 +73,7 @@ from quickmachotkey.constants import (
     cmdKey,
     controlKey,
     kVK_ANSI_D,
+    kVK_ANSI_M,
     kVK_RightShift,
     optionKey,
     shiftKey,
@@ -87,6 +92,10 @@ CHANNELS = 1  # Mono
 MAX_AUDIO_QUEUE_CHUNKS = 120  # ~30s of buffered audio at CHUNK_SIZE=4096
 CONNECT_TIMEOUT_SECONDS = 8.0
 FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
+# Batch mode: one HTTP request per recording, sent after you stop.
+MODES = ("live", "batch")
+BATCH_MIN_TIMEOUT_SECONDS = 20  # longer recordings get 10 s + half their length
+BATCH_ATTEMPTS = 2  # the audio is still in memory, so a failed request is retried once
 TRANSCRIPT_DEBUG_LOG = os.getenv("DICTATION_TRANSCRIPT_DEBUG", "1") != "0"
 CHARACTER_REPLACEMENTS_PATH = os.path.join(
     os.path.dirname(__file__), "character_replacements.json"
@@ -106,12 +115,14 @@ KEYTERMS_MAX_TOTAL_CHARS = 1000
 MODEL_PROFILES = {
     "v2": {
         "model_id": "scribe_v2_realtime",
+        "batch_model_id": "scribe_v2",
         "label": "Scribe v2 Realtime",
         "opencc_config": "s2t",
         "use_keyterms": False,
     },
     "v3": {
         "model_id": "scribe_v3_live",
+        "batch_model_id": "scribe_v3",
         "label": "Scribe v3 Live",
         "opencc_config": "s2tw",
         "use_keyterms": True,
@@ -131,7 +142,7 @@ SOUND_STOP = "/System/Library/Sounds/Tink.aiff"  # Sound when recording stops
 SOUND_START_VOLUME = 0.25
 SOUND_STOP_VOLUME = 0.25
 
-# Live preview on/off. Shared by v2 and v3 and kept across restarts.
+# Live preview on/off and live/batch mode. Shared by v2 and v3 and kept across restarts.
 SETTINGS_PATH = os.path.expanduser(
     "~/Library/Application Support/Dictation-App-11lab/settings.json"
 )
@@ -198,6 +209,12 @@ def hide_overlay():
     global status_overlay
     if status_overlay:
         AppHelper.callAfter(status_overlay.hide)
+
+
+def show_overlay_notice(text: str):
+    global status_overlay
+    if status_overlay:
+        AppHelper.callAfter(status_overlay.show_notice, text)
 
 
 def _log_preview_text(text: str, limit: int = 220) -> str:
@@ -736,8 +753,11 @@ def paste_text(text):
 
 
 class DictationApp:
-    def __init__(self, chinese="tw", model="v3"):
+    def __init__(self, chinese="tw", model="v3", mode="live"):
         self.profile = MODEL_PROFILES[model]
+        self.mode = mode  # "live" or "batch"; read when a recording starts
+        self.batch_sessions: set[int] = set()  # sessions recorded in batch mode
+        self.batch_tail: Optional[asyncio.Task] = None  # newest batch job (paste order)
         self.is_recording = False
         self.audio_stream = None
         self.audio_interface = None
@@ -800,6 +820,10 @@ class DictationApp:
         print(
             f"Model: {self.profile['label']} ({self.profile['model_id']}), "
             f"OpenCC: {self.profile['opencc_config']}, keyterms: {len(self.keyterms)}"
+        )
+        print(
+            f"Mode: {self.mode} "
+            f"(live = {self.profile['model_id']}, batch = {self.profile['batch_model_id']})"
         )
         print(
             f"Chinese output: {'Traditional (TW)' if chinese == 'tw' else 'Simplified (CN)'}"
@@ -1001,8 +1025,14 @@ class DictationApp:
             self.session_peak_audio[current_session] = 0
             self.session_rms_sum[current_session] = 0.0
 
-            # Create a NEW queue for this session (isolates from previous sessions)
-            self.audio_queue = Queue(maxsize=MAX_AUDIO_QUEUE_CHUNKS)
+            # The mode is fixed for the whole recording, even if it is switched meanwhile.
+            batch = self.mode == "batch"
+            if batch:
+                self.batch_sessions.add(current_session)
+
+            # Create a NEW queue for this session (isolates from previous sessions).
+            # Batch keeps the whole recording, so its queue has no size limit.
+            self.audio_queue = Queue(maxsize=0 if batch else MAX_AUDIO_QUEUE_CHUNKS)
             self.audio_queue_session_id = current_session
 
         # Start the existing stream object instead of closing/re-opening the
@@ -1015,7 +1045,10 @@ class DictationApp:
             play_sound(SOUND_START, SOUND_START_VOLUME)
             set_overlay_recording()
             print("\n🎙️  Recording started. Listening now...")
-            print("🔄 Connecting to ElevenLabs realtime...")
+            if batch:
+                print("📼 Batch mode: audio is sent when you stop")
+            else:
+                print("🔄 Connecting to ElevenLabs realtime...")
         except Exception as e:
             print(f"❌ Error starting audio stream: {e}")
             hide_overlay()
@@ -1032,7 +1065,11 @@ class DictationApp:
                     self.audio_queue = None
                     self.audio_queue_session_id = None
                 self.commit_events.pop(current_session, None)
+                self.batch_sessions.discard(current_session)
             return
+
+        if batch:
+            return  # nothing to connect; stop_recording sends the audio
 
         # Connect to ElevenLabs Realtime API (outside lock to keep hotkey responsive)
         try:
@@ -1263,6 +1300,14 @@ class DictationApp:
             self.audio_queue_session_id = None
             self.current_sender_task = None
 
+            if current_session in self.batch_sessions:
+                self.batch_tail = asyncio.create_task(
+                    self._finish_batch_session(
+                        old_audio_queue, current_session, self.batch_tail
+                    )
+                )
+                return
+
             # Clean up old session asynchronously in background and remember task
             self.cleanup_task = asyncio.create_task(
                 self._cleanup_session(
@@ -1367,27 +1412,133 @@ class DictationApp:
         except Exception as e:
             print(f"⚠️  Error during cleanup: {e}")
         finally:
-            self.commit_events.pop(session_to_cleanup, None)
-            self.last_committed_text_by_session.pop(session_to_cleanup, None)
-            self.connect_tasks.pop(session_to_cleanup, None)
-            self.stopping_sessions.discard(session_to_cleanup)
-            self.registered_connection_sessions.discard(session_to_cleanup)
-            self.session_started_sessions.discard(session_to_cleanup)
-            self.audio_callback_counts.pop(session_to_cleanup, None)
-            self.audio_drop_counts.pop(session_to_cleanup, None)
-            self.sender_chunk_counts.pop(session_to_cleanup, None)
-            self.session_peak_audio.pop(session_to_cleanup, None)
-            self.session_rms_sum.pop(session_to_cleanup, None)
-            self.sender_first_send_at.pop(session_to_cleanup, None)
-            # Clear active session only if this cleanup belongs to the active one
-            if self.active_session_id == session_to_cleanup:
-                self.active_session_id = None
-                hide_overlay()
-            elif not self.is_recording:
-                hide_overlay()
+            self._forget_session(session_to_cleanup)
             # Reset reference to this cleanup task
             if self.cleanup_task is asyncio.current_task():
                 self.cleanup_task = None
+
+    def _forget_session(self, session_id: int):
+        """Drop a finished session's bookkeeping and hide the overlay if it is idle."""
+        self.commit_events.pop(session_id, None)
+        self.last_committed_text_by_session.pop(session_id, None)
+        self.connect_tasks.pop(session_id, None)
+        self.stopping_sessions.discard(session_id)
+        self.registered_connection_sessions.discard(session_id)
+        self.session_started_sessions.discard(session_id)
+        self.batch_sessions.discard(session_id)
+        self.audio_callback_counts.pop(session_id, None)
+        self.audio_drop_counts.pop(session_id, None)
+        self.sender_chunk_counts.pop(session_id, None)
+        self.session_peak_audio.pop(session_id, None)
+        self.session_rms_sum.pop(session_id, None)
+        self.sender_first_send_at.pop(session_id, None)
+        # Clear active session only if this cleanup belongs to the active one
+        if self.active_session_id == session_id:
+            self.active_session_id = None
+            hide_overlay()
+        elif not self.is_recording:
+            hide_overlay()
+
+    def _batch_request(self, pcm: bytes, timeout_seconds: int) -> str:
+        """One blocking batch request (runs in a worker thread)."""
+        extra = {"keyterms": self.keyterms} if self.keyterms else {}
+        response = self.elevenlabs.speech_to_text.convert(
+            model_id=self.profile["batch_model_id"],
+            file=("dictation.pcm", pcm, "application/octet-stream"),
+            file_format="pcm_s16le_16",  # raw 16 kHz mono PCM, same as the mic stream
+            tag_audio_events=False,
+            no_verbatim=True,
+            request_options={"timeout_in_seconds": timeout_seconds},
+            **extra,
+        )
+        return (getattr(response, "text", "") or "").strip()
+
+    async def _transcribe_batch(self, pcm: bytes, session_id: int) -> Optional[str]:
+        """Send one recording to the batch API. Returns None when it failed."""
+        duration = len(pcm) / (SAMPLE_RATE * 2)
+        timeout_seconds = int(max(BATCH_MIN_TIMEOUT_SECONDS, 10 + duration / 2))
+        loop = asyncio.get_running_loop()
+        for attempt in range(1, BATCH_ATTEMPTS + 1):
+            started = time.monotonic()
+            try:
+                text = await loop.run_in_executor(
+                    None, self._batch_request, pcm, timeout_seconds
+                )
+            except Exception as e:
+                status = getattr(e, "status_code", None)
+                detail = (
+                    f"HTTP {status}: {getattr(e, 'body', '')}"
+                    if status is not None
+                    else f"{type(e).__name__}: {e}"
+                )
+                print(
+                    f"❌ Batch transcription failed (session {session_id}, "
+                    f"attempt {attempt}/{BATCH_ATTEMPTS}, "
+                    f"{time.monotonic() - started:.2f}s): {detail[:300]}"
+                )
+                # A 4xx (bad key, bad request) will not get better on a second try.
+                retryable = status is None or status >= 500 or status in (408, 429)
+                if not retryable or attempt == BATCH_ATTEMPTS:
+                    return None
+                await asyncio.sleep(0.5)
+            else:
+                print(
+                    f"📨 Batch transcript received (session {session_id}, "
+                    f"audio={duration:.1f}s, took {time.monotonic() - started:.2f}s)"
+                )
+                return text
+        return None
+
+    async def _finish_batch_session(
+        self,
+        audio_queue: Optional[Queue],
+        session_id: int,
+        previous: Optional[asyncio.Task] = None,
+    ):
+        """Batch mode: send the whole recording in one request, then paste."""
+        try:
+            text: Optional[str] = ""
+            try:
+                chunks = []
+                while audio_queue is not None:
+                    try:
+                        chunks.append(audio_queue.get_nowait())
+                    except Empty:
+                        break
+                pcm = b"".join(chunks)
+                if pcm:
+                    samples = array.array("h")
+                    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+                    if sys.byteorder != "little":
+                        samples.byteswap()
+                    peak = max(max(samples), -min(samples)) if samples else 0
+                    print(
+                        f"📤 Sending {len(pcm) / (SAMPLE_RATE * 2):.1f}s of audio to "
+                        f"{self.profile['batch_model_id']} "
+                        f"(session {session_id}, peak={peak})"
+                    )
+                    text = await self._transcribe_batch(pcm, session_id)
+                else:
+                    print(f"🧹 No audio captured (session {session_id})")
+            finally:
+                self._forget_session(session_id)
+
+            # Longer recordings take longer to come back; keep the paste order.
+            if previous is not None and not previous.done():
+                await asyncio.wait({previous})
+
+            if text is None:
+                show_overlay_notice("轉錄失敗")
+                print("❌ Nothing pasted: batch transcription failed\n")
+                return
+            if text:
+                log_transcript_stage(session_id, "event.batch", text)
+                await self._process_final_transcript(text, session_id)
+            else:
+                print("🧹 Suppressed empty/no-speech transcript")
+            print("✅ Transcription complete!\n")
+        except Exception as e:
+            print(f"⚠️  Error during batch transcription (session {session_id}): {e}")
 
     async def _process_final_transcript(self, text: str, session_id: int):
         """Process final transcript: convert characters, clean artifacts, paste."""
@@ -1685,6 +1836,33 @@ def handle_preview_hotkey():
         print(f"⚠️  Live preview toggle error: {e}")
 
 
+def toggle_transcribe_mode():
+    """Switch between live and batch, save it, and show a short notice."""
+    if not app:
+        return
+    app.mode = "batch" if app.mode == "live" else "live"
+    settings = load_settings()
+    settings["mode"] = app.mode
+    save_settings(settings)
+    print(f"🔀 Mode {app.mode} (applies to the next recording)")
+    play_sound(SOUND_START if app.mode == "batch" else SOUND_STOP, 0.15)
+    if status_overlay:
+        status_overlay.show_notice(
+            "模式：錄完再送（batch）" if app.mode == "batch" else "模式：即時（live）"
+        )
+
+
+# Hyper (Cmd+Option+Control) + Shift + M: switch live/batch mode.
+@quickHotKey(
+    virtualKey=kVK_ANSI_M, modifierMask=mask(cmdKey, controlKey, optionKey, shiftKey)
+)
+def handle_mode_hotkey():
+    try:
+        toggle_transcribe_mode()
+    except Exception as e:
+        print(f"⚠️  Mode toggle error: {e}")
+
+
 class AppDelegate(NSObject):
     """Simple app delegate for NSApplication."""
 
@@ -1703,13 +1881,17 @@ class AppDelegate(NSObject):
             "Press Cmd+Option+Control+Shift+D to toggle live preview "
             f"(now {'on' if live_preview_enabled else 'off'})."
         )
+        print(
+            "Press Cmd+Option+Control+Shift+M to switch live/batch mode "
+            f"(now {app.mode if app else '?'})."
+        )
         if right_shift_ptt_enabled:
             print("Hold Right Shift for push-to-talk.")
         print("(QuickMacHotKey will intercept the keypress - terminal won't see it)")
         print("Press Ctrl+C to exit.\n")
 
 
-def setup_async_loop(chinese, model):
+def setup_async_loop(chinese, model, mode):
     """Set up the async event loop in a separate thread."""
     global app, event_loop
 
@@ -1719,7 +1901,7 @@ def setup_async_loop(chinese, model):
     event_loop = loop
 
     # Create app instance
-    app = DictationApp(chinese=chinese, model=model)
+    app = DictationApp(chinese=chinese, model=model, mode=mode)
 
     # Signal that initialization is complete
     async_loop_ready.set()
@@ -1728,16 +1910,22 @@ def setup_async_loop(chinese, model):
     loop.run_forever()
 
 
-def start_app(chinese="tw", enable_right_shift_ptt=True, model="v3"):
+def start_app(chinese="tw", enable_right_shift_ptt=True, model="v3", mode=None):
     """Start the application with NSApplication event loop."""
     global right_shift_ptt_enabled, right_shift_ptt_monitor
 
     right_shift_ptt_enabled = enable_right_shift_ptt
     right_shift_ptt_monitor = None
 
+    # No --mode: use the one last picked with Hyper+Shift+M (live the first time).
+    if mode is None:
+        mode = load_settings().get("mode")
+    if mode not in MODES:
+        mode = "live"
+
     # Start asyncio event loop in a separate thread
     async_thread = threading.Thread(
-        target=setup_async_loop, args=(chinese, model), daemon=True
+        target=setup_async_loop, args=(chinese, model, mode), daemon=True
     )
     async_thread.start()
 
@@ -1773,7 +1961,7 @@ def start_app(chinese="tw", enable_right_shift_ptt=True, model="v3"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Dictation app using ElevenLabs Scribe v2 Realtime"
+        description="Dictation app using ElevenLabs Scribe (live or batch)"
     )
     parser.add_argument(
         "--chinese",
@@ -1792,9 +1980,17 @@ if __name__ == "__main__":
         default="v3",
         help="v3 (default) = Scribe v3 Live + keyterms.json + OpenCC s2tw; v2 = Scribe v2 Realtime (old setup)",
     )
+    parser.add_argument(
+        "--mode",
+        choices=MODES,
+        default=None,
+        help="live = stream while you speak; batch = send the whole recording when you stop. "
+        "Default: whatever was last picked with Hyper+Shift+M (live the first time)",
+    )
     args = parser.parse_args()
     start_app(
         chinese=args.chinese,
         enable_right_shift_ptt=not args.disable_right_shift_ptt,
         model=args.model,
+        mode=args.mode,
     )

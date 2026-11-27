@@ -87,9 +87,29 @@ source .venv/bin/activate
 python dictation.py
 ```
 
+### Live vs batch mode
+
+- **live** (default): audio is streamed to Scribe Live (`scribe_v3_live`) while you speak. Text comes back about 0.2 s after you stop, and the live preview works.
+- **batch**: the recording stays in memory and is sent in one request (`scribe_v3`) when you stop. No live preview; text comes back about 0.5–1.5 s after you stop (longer recordings take longer). If the request fails it is retried once; if it still fails nothing is pasted and the dot shows 「轉錄失敗」.
+
+Switch with **Cmd+Option+Control+Shift+M** (Hyper+Shift+M). The choice is saved and used on the next start. `--mode live` / `--mode batch` forces a mode for one run:
+
+```bash
+uv run dictation.py --mode batch
+```
+
+Both modes use the same keyterms, OpenCC conversion, replacements and clean-up. Compare them on the same audio without a microphone:
+
+```bash
+uv run python eval/mode_check.py                # TTS sentences
+uv run python eval/mode_check.py --wav my.m4a   # your own recording
+```
+
 ### Controls
 
 - **Cmd+Option+Control+D**: Toggle recording on/off (also works as Hyper Key + D if you have it configured)
+- **Cmd+Option+Control+Shift+D**: Toggle live preview
+- **Cmd+Option+Control+Shift+M**: Switch live/batch mode
 - **Right Shift (hold)**: Push-to-talk start while held, stop on release
 - **Ctrl+C**: Exit the application
 
