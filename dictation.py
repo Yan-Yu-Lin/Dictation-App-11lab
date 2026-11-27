@@ -1321,26 +1321,43 @@ class RightShiftPTT:
         self.app = app
         self.press_id = 0
         self.started_session = False
-        self.watch_tasks: list[asyncio.Task] = []
+        self.watch_tasks: dict[str, asyncio.Task] = {}
+        self.pressed_devices: set[str] = set()
+        self.rescan_task = None
+        self.stopping = False
 
     def start(self) -> int:
-        devices = []
+        self.stopping = False
+        self._scan_devices()
+        self.rescan_task = asyncio.create_task(self._rescan())
+        return len(self.watch_tasks)
+
+    def _scan_devices(self):
         for path in evdev.list_devices():
+            if path in self.watch_tasks:
+                continue
+            device = None
             try:
                 device = evdev.InputDevice(path)
+                keys = device.capabilities().get(ecodes.EV_KEY, [])
+                if ecodes.KEY_RIGHTSHIFT in keys:
+                    self.watch_tasks[path] = asyncio.create_task(self._watch(device, path))
+                    print(f"⇧ PTT watching {device.name} ({path})", flush=True)
+                    continue
             except OSError:
-                continue
-            keys = device.capabilities().get(ecodes.EV_KEY, [])
-            if ecodes.KEY_RIGHTSHIFT in keys:
-                devices.append(device)
-            else:
+                pass
+            if device is not None:
                 device.close()
 
-        for device in devices:
-            self.watch_tasks.append(asyncio.create_task(self._watch(device)))
-        return len(devices)
+    async def _rescan(self):
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                self._scan_devices()
+        except asyncio.CancelledError:
+            pass
 
-    async def _watch(self, device):
+    async def _watch(self, device, path):
         try:
             async for event in device.async_read_loop():
                 if (
@@ -1348,11 +1365,25 @@ class RightShiftPTT:
                     and event.code == ecodes.KEY_RIGHTSHIFT
                 ):
                     if event.value == 1:  # press (2 = autorepeat, ignored)
-                        self._on_press()
+                        was_pressed = bool(self.pressed_devices)
+                        self.pressed_devices.add(path)
+                        if not was_pressed:
+                            self._on_press()
                     elif event.value == 0:  # release
-                        self._on_release()
+                        self._release_device(path)
         except (OSError, asyncio.CancelledError):
             pass  # device unplugged or shutdown
+        finally:
+            device.close()
+            self._release_device(path)
+            if self.watch_tasks.get(path) is asyncio.current_task():
+                self.watch_tasks.pop(path, None)
+
+    def _release_device(self, path):
+        was_pressed = path in self.pressed_devices
+        self.pressed_devices.discard(path)
+        if was_pressed and not self.pressed_devices and not self.stopping:
+            self._on_release()
 
     def _on_press(self):
         self.press_id += 1
@@ -1379,9 +1410,13 @@ class RightShiftPTT:
             await asyncio.sleep(0.02)
 
     def stop(self):
-        for task in self.watch_tasks:
+        self.stopping = True
+        if self.rescan_task:
+            self.rescan_task.cancel()
+        for task in list(self.watch_tasks.values()):
             task.cancel()
         self.watch_tasks.clear()
+        self.pressed_devices.clear()
 
 
 async def handle_control_client(app: DictationApp, reader, writer):
@@ -1475,10 +1510,9 @@ async def run_daemon(chinese: str, enable_right_shift_ptt: bool = True):
                     f"(hold to record; watching {watched} input device(s))"
                 )
             else:
-                ptt = None
                 print(
                     "⚠️  No readable keyboard devices found; Right Shift "
-                    "push-to-talk disabled (are you in the `input` group?)"
+                    "push-to-talk waiting for devices (are you in the `input` group?)"
                 )
 
     server = await asyncio.start_unix_server(
