@@ -69,10 +69,14 @@ FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
 # Scribe answers every commit, so a slow answer is still worth waiting for:
 # giving up drops the end of what you said. This is the hard limit.
 FINAL_TRANSCRIPT_MAX_SECONDS = 8.0
-# Scribe Live commits by itself after ~35 s of uncommitted audio. If at least this
-# much was uncommitted when you stopped, an auto-commit may still be on its way,
-# so the stop waits for one more answer (the first one might be that auto-commit).
-AUTO_COMMIT_RISK_SECONDS = 28.0
+# Scribe Live commits by itself after ~35 s of uncommitted audio. The app commits
+# first, every FORCE_COMMIT_SECONDS of sent audio, so every commit is the app's own
+# and the stop can wait for exactly "answers == commits sent" (same design as the
+# phone gateway). Each answer is held and the whole recording is pasted at stop.
+FORCE_COMMIT_SECONDS = 25.0
+# A commit needs >= 0.3 s of new audio or Scribe replies commit_throttled and closes;
+# the stop always sends this much silence first.
+FINAL_PAD_SECONDS = 0.4
 # systemctl stop: how long to let stopped recordings finish transcribing and paste.
 SHUTDOWN_FINISH_SECONDS = 20.0
 SHUTDOWN_MEDIA_SECONDS = 2.0
@@ -325,6 +329,7 @@ class DotOverlay:
         )
         self.send_lock = threading.Lock()  # partials arrive from the SDK thread
         self.fallback: Optional[StatusNotifier] = None  # used once the dot has died
+        self.mode = "hidden"  # last state shown, replayed on the fallback
         time.sleep(0.3)
         if self.process.poll() is not None:
             raise RuntimeError(
@@ -344,35 +349,46 @@ class DotOverlay:
         except Exception:
             return False
 
-    def _alive(self, command: str) -> bool:
-        """Send, and switch to desktop notifications if the dot died."""
+    def _fall_back(self):
+        """The dot died: switch to notifications and show the current state once."""
+        if self.fallback is not None:
+            return
+        print("⚠️  Floating dot exited; using notifications from now on")
+        self.fallback = StatusNotifier()
+        if self.mode == "recording":
+            self.fallback.show_recording()
+        elif self.mode == "finalizing":
+            self.fallback.show_finalizing()
+
+    def _show(self, command: str, mode: Optional[str] = None) -> bool:
+        """Send a state command; on failure fall back. True if the dot got it."""
+        if mode is not None:
+            self.mode = mode
         if self._send(command):
             return True
-        if self.fallback is None:
-            print("⚠️  Floating dot exited; using notifications from now on")
-            self.fallback = StatusNotifier()
+        self._fall_back()
         return False
 
     def show_recording(self):
-        if not self._alive("recording"):
+        if not self._show("recording", "recording") and self.fallback:
             self.fallback.show_recording()
 
     def show_finalizing(self):
-        if not self._alive("finalizing"):
+        if not self._show("finalizing", "finalizing") and self.fallback:
             self.fallback.show_finalizing()
 
     def show_partial(self, text: str):
-        self._send("partial " + text.replace("\n", " "))
+        self._show("partial " + text.replace("\n", " "))
 
     def show_notice(self, text: str):
-        if not self._alive("notice " + text.replace("\n", " ")):
+        if not self._show("notice " + text.replace("\n", " ")) and self.fallback:
             self.fallback.show_notice(text)
 
     def set_preview(self, enabled: bool):
-        self._send("preview " + ("on" if enabled else "off"))
+        self._show("preview " + ("on" if enabled else "off"))
 
     def hide(self):
-        if not self._alive("hide"):
+        if not self._show("hide", "hidden") and self.fallback:
             self.fallback.hide()
 
     def shutdown(self):
@@ -432,6 +448,9 @@ class MediaPauser:
         self.busy = False
         self.retry_at: Optional[float] = None
         self.attempts = 0
+        # Players whose resume kept failing: still owned (shutdown tries them
+        # again), but the worker stops retrying them on its own.
+        self.parked: list[str] = []
         if not self.enabled:
             print("⚠️  gdbus not found; media pausing disabled")
             return
@@ -494,6 +513,7 @@ class MediaPauser:
             self.want_paused = recording
             self.retry_at = None
             self.attempts = 0
+            self.parked = []  # a new edge gives parked players another round
             self.cond.notify_all()
 
     def restore(self, timeout: float) -> bool:
@@ -505,8 +525,14 @@ class MediaPauser:
             self.stopped = True
             self.want_paused = False
             self.retry_at = None
+            self.attempts = 0
+            self.parked = []  # last chance for every player we still own
             self.cond.notify_all()
-            while (self.busy or self.owned) and time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                if not self.owned:
+                    break
+                if not self.busy and set(self.owned) <= set(self.parked):
+                    break  # every attempt for them has failed again
                 self.cond.wait(timeout=0.05)
             left = list(self.owned)
         if left:
@@ -521,7 +547,7 @@ class MediaPauser:
         while True:
             if self.want_paused and not self.scanned:
                 return "pause"
-            if not self.want_paused and self.owned:
+            if not self.want_paused and any(p not in self.parked for p in self.owned):
                 now = time.monotonic()
                 if self.retry_at is None or now >= self.retry_at:
                     return "resume"
@@ -546,16 +572,17 @@ class MediaPauser:
             return self.want_paused
 
     def _pause_playing(self):
+        """Pause whatever is Playing now. Players we already own are checked too:
+        owning one only means we must resume it later, not that it is paused now
+        (you may have pressed play, or a resume finished just before this)."""
         paused = []
         for player in self._players() or []:
             if not self._wanted():
                 break  # the recording already stopped: pause nothing more
-            with self.cond:
-                if player in self.owned:
-                    continue
             if self._status(player) == "Playing" and self._call(player, "Pause"):
                 with self.cond:
-                    self.owned.append(player)  # recorded at once, not after the scan
+                    if player not in self.owned:
+                        self.owned.append(player)  # recorded at once, not after the scan
                 paused.append(player)
         with self.cond:
             if self.want_paused:
@@ -571,7 +598,7 @@ class MediaPauser:
         done, resumed, failed = [], [], []
         for player in players:
             if self._wanted():
-                return  # a new recording started meanwhile: keep them paused
+                break  # a new recording started: keep the rest paused (results so far still apply)
             if live is not None and player not in live:
                 done.append(player)  # the player was closed
                 continue
@@ -588,12 +615,15 @@ class MediaPauser:
                 failed.append(player)  # could not even read it
         with self.cond:
             self.owned = [p for p in self.owned if p not in done]
-            if failed:
+            self.parked = [p for p in self.parked if p in self.owned]
+            if failed and not self.want_paused:
                 self.attempts += 1
-                if self.attempts >= self.MAX_RESUME_ATTEMPTS and not self.stopped:
+                if self.attempts >= self.MAX_RESUME_ATTEMPTS:
                     names = ", ".join(p[len(self.MPRIS_PREFIX):] for p in failed)
-                    print(f"⚠️  Giving up resuming playback: {names}")
-                    self.owned = [p for p in self.owned if p not in failed]
+                    print(f"⚠️  Could not resume playback yet, will try again later: {names}")
+                    # Keep ownership; stop the retry loop until the next
+                    # recording edge or shutdown gives them another round.
+                    self.parked = sorted(set(self.parked) | set(failed))
                     self.attempts = 0
                     self.retry_at = None
                 else:
@@ -603,6 +633,31 @@ class MediaPauser:
                 self.retry_at = None
         if resumed:
             print(f"▶️  Resumed playback ({len(resumed)} player(s))")
+
+
+async def _run_in_daemon_thread(func, *args):
+    """Run a blocking call on a daemon thread and await its result.
+
+    Unlike the default executor, nothing waits for this thread at exit: when
+    shutdown gives up on a stuck HTTP request, the process can still exit on time.
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def runner():
+        try:
+            result = func(*args)
+        except BaseException as error:  # handed to the awaiting coroutine
+            loop.call_soon_threadsafe(
+                lambda error=error: future.done() or future.set_exception(error)
+            )
+        else:
+            loop.call_soon_threadsafe(
+                lambda: future.done() or future.set_result(result)
+            )
+
+    threading.Thread(target=runner, name="batch-http", daemon=True).start()
+    return await future
 
 
 def set_media_paused(recording: bool):
@@ -1011,8 +1066,9 @@ class DictationApp:
         self.finalizers: set[asyncio.Task] = set()
         # Live mode: text Scribe committed while still recording, pasted at stop.
         self.live_segments: dict[int, list[str]] = {}
-        # Live mode: committed events seen, and seconds of audio sent since the
-        # last one (Scribe auto-commits after ~35 s of uncommitted audio).
+        # Live mode: commits the app sent, answers received, and seconds of
+        # audio sent since the last commit.
+        self.commits_sent: dict[int, int] = {}
         self.commit_counts: dict[int, int] = {}
         self.uncommitted_seconds: dict[int, float] = {}
         self.commit_signal: dict[int, asyncio.Event] = {}
@@ -1280,6 +1336,7 @@ class DictationApp:
             current_session = self.session_id
             self.active_session_id = current_session
             self.commit_events[current_session] = asyncio.Event()
+            self.commits_sent[current_session] = 0
             self.commit_counts[current_session] = 0
             self.uncommitted_seconds[current_session] = 0.0
             self.audio_callback_counts[current_session] = 0
@@ -1410,9 +1467,6 @@ class DictationApp:
             )
             if current_session in self.stopping_sessions:
                 return
-            if not self.finalizers:
-                hide_overlay()
-            show_overlay_notice("連線失敗")
             set_media_paused(False)
             self._stop_audio_stream()
             if self.active_session_id == current_session:
@@ -1423,14 +1477,13 @@ class DictationApp:
                 self.is_recording = False
                 self.active_session_id = None
             self._forget_session(current_session)
+            self._refresh_indicator()
+            show_overlay_notice("連線失敗")
             return
         except Exception as e:
             print(f"❌ Error connecting to ElevenLabs: {e}")
             if current_session in self.stopping_sessions:
                 return
-            if not self.finalizers:
-                hide_overlay()
-            show_overlay_notice("連線失敗")
             set_media_paused(False)
             self._stop_audio_stream()
             if self.active_session_id == current_session:
@@ -1441,6 +1494,8 @@ class DictationApp:
                 self.is_recording = False
                 self.active_session_id = None
             self._forget_session(current_session)
+            self._refresh_indicator()
+            show_overlay_notice("連線失敗")
 
     async def send_audio_chunks(self, connection, audio_queue: Queue, session_id: int):
         """Send audio chunks from the queue to ElevenLabs for one session."""
@@ -1473,9 +1528,7 @@ class DictationApp:
                     await connection.send(
                         {"audio_base_64": audio_base64, "sample_rate": SAMPLE_RATE}
                     )
-                    self.uncommitted_seconds[session_id] = self.uncommitted_seconds.get(
-                        session_id, 0.0
-                    ) + len(audio_data) / (SAMPLE_RATE * 2)
+                    await self._count_sent_audio(connection, session_id, audio_data)
                     chunk_count = self.sender_chunk_counts.get(session_id, 0) + 1
                     self.sender_chunk_counts[session_id] = chunk_count
                     chunk_peak, chunk_rms = pcm16_level(audio_data)
@@ -1593,8 +1646,15 @@ class DictationApp:
         self.finalizers.discard(task)
         if self.delivery_tail is task:
             self.delivery_tail = None
-        # The indicator goes away only when nothing is recording or pending.
-        if not self.is_recording and not self.finalizers:
+        self._refresh_indicator()
+
+    def _refresh_indicator(self):
+        """One place decides the dot: recording > finishing > hidden."""
+        if self.is_recording:
+            set_overlay_recording()
+        elif self.finalizers or self.stopping_sessions:
+            set_overlay_finalizing()
+        else:
             hide_overlay()
 
     @staticmethod
@@ -1625,9 +1685,7 @@ class DictationApp:
                 {"audio_base_64": audio_base64, "sample_rate": SAMPLE_RATE}
             )
             flushed += 1
-            self.uncommitted_seconds[session_to_cleanup] = self.uncommitted_seconds.get(
-                session_to_cleanup, 0.0
-            ) + len(audio_data) / (SAMPLE_RATE * 2)
+            await self._count_sent_audio(connection, session_to_cleanup, audio_data)
             self.sender_chunk_counts[session_to_cleanup] = (
                 self.sender_chunk_counts.get(session_to_cleanup, 0) + 1
             )
@@ -1697,41 +1755,51 @@ class DictationApp:
             await self._process_final_transcript(text, sid)
         print("✅ Transcription complete!\n")
 
-    async def _commit_and_wait(self, connection, sid: int):
-        """Commit the end of the audio and wait for the answer to *that* commit.
+    async def _count_sent_audio(self, connection, sid: int, audio_data: bytes):
+        """Track audio sent since the last commit; commit before Scribe would."""
+        seconds = self.uncommitted_seconds.get(sid, 0.0) + len(audio_data) / (SAMPLE_RATE * 2)
+        self.uncommitted_seconds[sid] = seconds
+        if seconds >= FORCE_COMMIT_SECONDS:
+            await connection.commit()
+            self.commits_sent[sid] = self.commits_sent.get(sid, 0) + 1
+            self.uncommitted_seconds[sid] = 0.0
+            print(f"✂️  Committed a {seconds:.0f}s piece (session {sid})")
 
-        Scribe answers every manual commit with one committed_transcript, and also
-        commits by itself after ~35 s of uncommitted audio. If enough audio was
-        uncommitted that such an auto-commit may be in flight, the first answer
-        after our commit could be that auto-commit, so we also wait a little for
-        a second one.
+    async def _commit_and_wait(self, connection, sid: int):
+        """Commit the end of the audio and wait until every commit is answered.
+
+        All commits are the app's own (see FORCE_COMMIT_SECONDS), and Scribe
+        answers each one exactly once (an empty answer for silence), so the
+        recording is complete when answers == commits sent. The deadline is one
+        absolute limit for the whole wait.
         """
         signal_event = asyncio.Event()
         self.commit_signal[sid] = signal_event
-        base = self.commit_counts.get(sid, 0)
-        risky = self.uncommitted_seconds.get(sid, 0.0) >= AUTO_COMMIT_RISK_SECONDS
+        pad = bytes(int(SAMPLE_RATE * FINAL_PAD_SECONDS) * 2)
+        await connection.send(
+            {"audio_base_64": base64.b64encode(pad).decode("utf-8"), "sample_rate": SAMPLE_RATE}
+        )
         await connection.commit()
-
-        async def wait_for_count(count: int, seconds: float) -> bool:
-            deadline = time.monotonic() + seconds
-            while self.commit_counts.get(sid, 0) < count:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                signal_event.clear()
-                if self.commit_counts.get(sid, 0) >= count:
-                    break
-                try:
-                    await asyncio.wait_for(signal_event.wait(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    pass
-            return True
-
-        if not await wait_for_count(base + 1, FINAL_TRANSCRIPT_MAX_SECONDS):
-            print("⚠️  Final transcript event timed out; closing session")
-            return
-        if risky and not await wait_for_count(base + 2, FINAL_TRANSCRIPT_TIMEOUT_SECONDS):
-            pass  # no auto-commit was in flight: the one answer was ours
+        self.commits_sent[sid] = self.commits_sent.get(sid, 0) + 1
+        self.uncommitted_seconds[sid] = 0.0
+        deadline = time.monotonic() + FINAL_TRANSCRIPT_MAX_SECONDS
+        while self.commit_counts.get(sid, 0) < self.commits_sent[sid]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(
+                    f"⚠️  Final transcript timed out ({self.commit_counts.get(sid, 0)}/"
+                    f"{self.commits_sent[sid]} commits answered); pasting what arrived"
+                )
+                return
+            signal_event.clear()
+            if self.commit_counts.get(sid, 0) >= self.commits_sent[sid]:
+                break
+            try:
+                await asyncio.wait_for(signal_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
+        if self.commit_counts.get(sid, 0) > self.commits_sent[sid]:
+            print("⚠️  More answers than commits (Scribe auto-committed); text may be incomplete")
 
     def _forget_session(self, session_id: int):
         """Drop a finished session's bookkeeping and hide the overlay if it is idle."""
@@ -1749,6 +1817,7 @@ class DictationApp:
         self.session_peak_audio.pop(session_id, None)
         self.session_rms_sum.pop(session_id, None)
         self.sender_first_send_at.pop(session_id, None)
+        self.commits_sent.pop(session_id, None)
         self.commit_counts.pop(session_id, None)
         self.uncommitted_seconds.pop(session_id, None)
         self.commit_signal.pop(session_id, None)
@@ -1774,12 +1843,11 @@ class DictationApp:
         """Send one recording to the batch API. Returns None when it failed."""
         duration = len(pcm) / (SAMPLE_RATE * 2)
         timeout_seconds = int(max(BATCH_MIN_TIMEOUT_SECONDS, 10 + duration / 2))
-        loop = asyncio.get_running_loop()
         for attempt in range(1, BATCH_ATTEMPTS + 1):
             started = time.monotonic()
             try:
-                text = await loop.run_in_executor(
-                    None, self._batch_request, pcm, timeout_seconds
+                text = await _run_in_daemon_thread(
+                    self._batch_request, pcm, timeout_seconds
                 )
             except Exception as e:
                 status = getattr(e, "status_code", None)
@@ -2012,7 +2080,6 @@ class DictationApp:
             # answered) only after its text is stored, then wake the stop path.
             if session_id in self.commit_events:
                 self.commit_counts[session_id] = self.commit_counts.get(session_id, 0) + 1
-                self.uncommitted_seconds[session_id] = 0.0
                 signal_event = self.commit_signal.get(session_id)
                 if signal_event is not None:
                     signal_event.set()
@@ -2423,3 +2490,7 @@ if __name__ == "__main__":
         )
     except KeyboardInterrupt:
         print("\n\nShutting down...")
+    # Shutdown already waited as long as it should; don't let a stuck worker
+    # thread (a hung paste or HTTP call) keep the process past systemd's limit.
+    sys.stdout.flush()
+    os._exit(0)

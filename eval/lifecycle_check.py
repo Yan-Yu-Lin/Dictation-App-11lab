@@ -48,17 +48,25 @@ async def fake_paste(text, session_id):
 
 
 class FakeConnection:
-    """Answers commits like Scribe; lets a test inject an in-flight auto-commit."""
+    """Answers each commit like Scribe: one committed_transcript per commit, in order.
+
+    `answers` is a list of (delay_seconds, text), one per commit the app will send.
+    """
 
     def __init__(self, app, sid, answers):
         self.app, self.sid, self.answers = app, sid, list(answers)
         self.closed = False
+        self.commits = 0
+        self.sent_seconds = 0.0
 
     async def send(self, data):
-        pass
+        import base64 as b64
+        self.sent_seconds += len(b64.b64decode(data["audio_base_64"])) / 32000
 
     async def commit(self):
-        for delay, text in self.answers:
+        self.commits += 1
+        if self.answers:
+            delay, text = self.answers.pop(0)
             asyncio.get_running_loop().call_later(
                 delay, self.app.on_committed_transcript, {"text": text}, self.sid
             )
@@ -90,7 +98,7 @@ def make_app(mode):
     return app
 
 
-async def live_session(app, answers, held=(), uncommitted=0.0):
+async def live_session(app, answers, held=(), audio_seconds=0.0):
     """Run one live recording through the real start/stop code with a fake socket."""
     real_connect = app.elevenlabs.speech_to_text.realtime.connect
 
@@ -106,9 +114,14 @@ async def live_session(app, answers, held=(), uncommitted=0.0):
     app.mode = "live"
     conn = FakeConnection(app, sid, answers)
     app.connection = conn
-    for text in held:
+    for text in held:  # pieces from earlier commits that were already answered
+        app.commits_sent[sid] += 1
         app.on_committed_transcript({"text": text}, sid)
-    app.uncommitted_seconds[sid] = uncommitted
+    # Audio sent during the recording, through the real counting code.
+    chunk = bytes(32000)  # 1 s
+    for _ in range(int(audio_seconds)):
+        await app._count_sent_audio(conn, sid, chunk)
+    app.last_connection = conn
     await app.stop_recording()
     app.elevenlabs.speech_to_text.realtime.connect = real_connect
     return sid
@@ -123,13 +136,29 @@ async def settle(app, limit=10):
 async def r3():
     print("\n== R3 live stop barrier ==")
     app = make_app("live")
-    # Stopped near the 35 s mark: an auto-commit is already on its way, the real tail after it.
+    # 33 s of audio: the app itself commits at 25 s (so Scribe never auto-commits),
+    # then the stop commits the rest. The 25 s answer is fast, the tail slow (3 s):
+    # the wait must cover both answers (B1).
     pasted.clear()
-    await live_session(
-        app, [(0.1, "earlier auto-commit,"), (0.6, "real tail")], uncommitted=33.0
-    )
+    await live_session(app, [(0.1, "first 25 s,"), (3.0, "real tail")], audio_seconds=33)
+    await settle(app, limit=15)
+    conn = app.last_connection
+    check("app commits at 25 s itself (2 commits for 33 s)", conn.commits == 2, conn.commits)
+    check("auto-commit-sized recording keeps a slow tail", pasted == ["first 25 s, real tail"], pasted)
+
+    # 60 s, answers arrive late and out of the "35 s" rhythm: still all of it, once.
+    pasted.clear()
+    await live_session(app, [(2.5, "a"), (0.2, "b"), (1.0, "c")], audio_seconds=60)
+    await settle(app, limit=15)
+    conn = app.last_connection
+    check("60 s: 3 commits, every answer kept", conn.commits == 3 and pasted == ["abc"], (conn.commits, pasted))
+
+    # The stop always sends >= 0.3 s of padding before its commit (no commit_throttled).
+    pasted.clear()
+    await live_session(app, [(0.05, "x")], audio_seconds=25)
     await settle(app)
-    check("in-flight auto-commit does not end the wait", pasted == ["earlier auto-commit, real tail"], pasted)
+    conn = app.last_connection
+    check("final commit always has >= 0.3 s new audio", conn.sent_seconds >= 25.3, conn.sent_seconds)
 
     # Held pieces + a final tail that arrives late (3 s): included, one paste.
     pasted.clear()
@@ -160,7 +189,7 @@ async def r3():
     await live_session(app, [(0.1, "")], held=["held only"])
     await settle(app)
     check("empty final answer still ends the wait", pasted == ["held only"], pasted)
-    left = {n: getattr(app, n) for n in ("live_segments", "commit_counts", "commit_signal", "finalizers", "commit_events") if getattr(app, n)}
+    left = {n: getattr(app, n) for n in ("live_segments", "commit_counts", "commits_sent", "commit_signal", "finalizers", "commit_events") if getattr(app, n)}
     check("no leftover live state", not left, left)
 
 
@@ -188,6 +217,64 @@ async def r4_r8():
     await settle(app)
     check("pastes in recording order", pasted == ["first batch", "second live"], pasted)
     check("overlay hidden once everything is done", overlay[-1:] == ["hide"], overlay[-3:])
+
+
+async def b5():
+    print("\n== B5 indicator transitions ==")
+    app = make_app("batch")
+    overlay.clear()
+    release = threading.Event()
+
+    def slow_batch(pcm, timeout):
+        release.wait(5)
+        return "older"
+
+    app._batch_request = slow_batch
+    await app.start_recording()
+    app.audio_callback(bytes(32000), 1, None, None)
+    await app.stop_recording()  # older recording, still finishing
+    app.mode = "live"
+
+    async def broken(*a, **k):
+        raise RuntimeError("offline")
+
+    app.elevenlabs.speech_to_text.realtime.connect = broken
+    await app.start_recording()  # a new live recording that fails to connect
+    await asyncio.sleep(0.2)
+    check("failed start while older one finishes -> back to finalizing",
+          overlay[-2:] == ["finalizing", "notice 連線失敗"] and not app.is_recording, overlay[-4:])
+    release.set()
+    await settle(app)
+    check("hidden once the older one pasted", overlay[-1] == "hide", overlay[-3:])
+
+
+def b6():
+    print("\n== B6 dot dies mid-recording ==")
+    shown = []
+
+    class Notes:
+        def show_recording(self): shown.append("recording")
+        def show_finalizing(self): shown.append("finalizing")
+        def show_notice(self, t): shown.append("notice")
+        def hide(self): shown.append("hide")
+
+    class DeadProcess:
+        def poll(self): return 1
+
+    dot = dictation.DotOverlay.__new__(dictation.DotOverlay)
+    dot.send_lock = threading.Lock()
+    dot.fallback = None
+    dot.mode = "hidden"
+    dot.process = DeadProcess()
+    real = dictation.StatusNotifier
+    dictation.StatusNotifier = Notes
+    try:
+        dot.mode = "recording"  # the dot got "recording", then died
+        dot.show_partial("hello")
+    finally:
+        dictation.StatusNotifier = real
+    check("first failed partial switches to notifications and shows recording",
+          dot.fallback is not None and shown == ["recording"], shown)
 
 
 async def r2():
@@ -312,6 +399,49 @@ def media():
     time.sleep(0.4); wait_idle(p)
     check("quick stop+start ends paused", bus.states[A] == "Paused", bus.states)
 
+    # B2: resume interrupted by a new recording: what was resumed is not "owned
+    # and paused" any more, and the new scan pauses it again.
+    bus.states = {A: "Playing", B: "Playing"}
+    p.set_recording(True)
+    time.sleep(0.3); wait_idle(p)
+    real_call = p._call
+
+    def call_then_start(player, method):
+        ok = real_call(player, method)
+        if method == "Play" and player == A:
+            p.set_recording(True)  # you start talking again right after A resumed
+        return ok
+
+    p._call = call_then_start
+    p.set_recording(False)
+    time.sleep(0.5); wait_idle(p)
+    p._call = real_call
+    check("interrupted resume: new recording pauses A again", bus.states[A] == "Paused" and A in p.owned, (bus.states, p.owned))
+    p.set_recording(False)
+    time.sleep(0.4); wait_idle(p)
+
+    # B2: you resumed it yourself, then stop+start happen before the worker runs.
+    bus.states = {A: "Playing", B: "Paused"}
+    p.set_recording(True)
+    time.sleep(0.3); wait_idle(p)
+    bus.states[A] = "Playing"  # you pressed play
+    p.set_recording(False)
+    p.set_recording(True)
+    time.sleep(0.4); wait_idle(p)
+    check("owned but playing again gets paused by the next recording", bus.states[A] == "Paused", bus.states)
+    p.set_recording(False)
+    time.sleep(0.4); wait_idle(p)
+
+    # B3: Play keeps failing past the retry budget -> still owned; restore at shutdown resumes it.
+    bus.states = {A: "Playing", B: "Paused"}
+    p.set_recording(True)
+    time.sleep(0.3); wait_idle(p)
+    bus.fail_play.add(A)
+    p.set_recording(False)
+    time.sleep(0.2 + p.MAX_RESUME_ATTEMPTS * p.RETRY_SECONDS + 0.5); wait_idle(p)
+    check("after retries run out, A is still owned", A in p.owned and bus.states[A] == "Paused", (p.owned, bus.states))
+    bus.fail_play.clear()
+
     # Shutdown restore while still owning a paused player.
     ok = p.restore(2.0)
     check("restore at shutdown resumes it", ok and bus.states[A] == "Playing", bus.states)
@@ -324,6 +454,8 @@ async def main():
     dictation.event_loop = asyncio.get_running_loop()
     await r3()
     await r4_r8()
+    await b5()
+    b6()
     await r2()
 
 
