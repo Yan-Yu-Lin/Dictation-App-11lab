@@ -26,10 +26,6 @@ def main() -> int:
     client.settimeout(3)
     try:
         client.connect(SOCKET_PATH)
-        client.sendall(command.encode() + b"\n")
-        response = client.recv(256).decode("utf-8", "replace").strip()
-        print(response)
-        return 0
     except OSError as e:
         print(f"dictation daemon not running? ({e})")
         if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
@@ -37,6 +33,20 @@ def main() -> int:
                 "notify-send -a Dictation -u critical "
                 "'Dictation daemon not running' 'Start it with: uv run dictation.py'"
             )
+        client.close()
+        return 1
+
+    # Connected: the daemon is alive. A stop can take a few seconds on a slow
+    # connection (it lets the sender finish, up to 3 s), so wait longer for the
+    # reply, and never report a slow reply as "not running".
+    try:
+        client.settimeout(10)
+        client.sendall(command.encode() + b"\n")
+        response = client.recv(256).decode("utf-8", "replace").strip()
+        print(response)
+        return 0
+    except OSError as e:
+        print(f"dictation daemon is running but did not answer in time ({e})")
         return 1
     finally:
         client.close()
