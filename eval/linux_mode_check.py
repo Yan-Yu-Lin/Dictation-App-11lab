@@ -71,8 +71,7 @@ async def speak(app, pcm: bytes, realtime: bool):
 
 async def settle(app):
     for _ in range(600):
-        busy = [t for t in (app.cleanup_task, app.batch_tail) if t is not None and not t.done()]
-        if not busy and not app.paste_lock.locked():
+        if not app.finalizers and not app.paste_lock.locked():
             await asyncio.sleep(0.3)
             if not app.paste_lock.locked():
                 return
@@ -90,8 +89,7 @@ async def one(app, pcm: bytes) -> tuple[str, float]:
             took = time.monotonic() - stopped
             await settle(app)
             return pasted[-1], took
-        tail = app.batch_tail if app.mode == "batch" else app.cleanup_task
-        if tail is None or tail.done():
+        if not app.finalizers:
             await asyncio.sleep(0.4)
             if len(pasted) > before:
                 return pasted[-1], time.monotonic() - stopped
@@ -156,7 +154,7 @@ async def checks(clips, model: str):
 
     leftovers = {
         name: getattr(app, name)
-        for name in ("batch_sessions", "stopping_sessions", "commit_events", "audio_callback_counts")
+        for name in ("batch_sessions", "stopping_sessions", "commit_events", "audio_callback_counts", "finalizers")
         if getattr(app, name)
     }
     print(f"  leftover state  -> {leftovers or 'none'} (want none); "
@@ -186,7 +184,7 @@ async def long_live(clips, model: str):
         print(f"  text ({len(text)} chars): {text[:160]}...")
     leftovers = {
         name: getattr(app, name)
-        for name in ("live_segments", "stopping_sessions", "commit_events", "paste_tasks")
+        for name in ("live_segments", "stopping_sessions", "commit_events", "finalizers", "commit_counts")
         if getattr(app, name)
     }
     print(f"  leftover state         -> {leftovers or 'none'} (want none)")

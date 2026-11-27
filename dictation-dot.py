@@ -14,6 +14,7 @@ Uses the SYSTEM python3 (needs python-gobject + gtk4-layer-shell packages) and
 must be launched with LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so.
 """
 
+import os
 import sys
 
 import gi
@@ -277,12 +278,12 @@ def main():
         # Keep the app alive while the window is hidden
         gtk_app.hold()
 
-        def on_stdin(channel, _condition):
-            line = sys.stdin.readline()
-            if not line:  # daemon died, EOF
-                gtk_app.quit()
-                return False
-            command = line.rstrip("\n")
+        fd = sys.stdin.fileno()
+        os.set_blocking(fd, False)
+        pending = bytearray()
+
+        def run_command(command: str) -> bool:
+            """Apply one command; False means quit."""
             dot = holder["dot"]
             try:
                 if command == "recording":
@@ -292,7 +293,6 @@ def main():
                 elif command == "hide":
                     dot.hide()
                 elif command == "quit":
-                    gtk_app.quit()
                     return False
                 elif command.startswith("partial "):
                     dot.show_partial(command[len("partial "):])
@@ -306,8 +306,40 @@ def main():
                 print(f"dictation-dot: {command!r} failed: {e}", file=sys.stderr)
             return True
 
-        channel = GLib.IOChannel.unix_new(sys.stdin.fileno())
-        GLib.io_add_watch(channel, GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, on_stdin)
+        def on_stdin(_fd, condition):
+            # Read the raw fd until it is empty and run every complete line.
+            # (A buffered sys.stdin.readline() here would leave extra lines in
+            # Python's buffer, where this fd watch never sees them.)
+            eof = False
+            while True:
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    eof = True
+                    break
+                if not chunk:
+                    eof = True
+                    break
+                pending.extend(chunk)
+            while b"\n" in pending:
+                line, _, rest = bytes(pending).partition(b"\n")
+                pending[:] = rest
+                if not run_command(line.decode("utf-8", "replace")):
+                    gtk_app.quit()
+                    return False
+            if eof or condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
+                gtk_app.quit()  # the daemon is gone: don't leave a dot behind
+                return False
+            return True
+
+        GLib.unix_fd_add_full(
+            GLib.PRIORITY_DEFAULT,
+            fd,
+            GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
+            on_stdin,
+        )
 
     app.connect("activate", on_activate)
     app.run(None)
