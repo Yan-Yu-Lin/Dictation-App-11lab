@@ -77,6 +77,9 @@ FORCE_COMMIT_SECONDS = 25.0
 # A commit needs >= 0.3 s of new audio or Scribe replies commit_throttled and closes;
 # the stop always sends this much silence first.
 FINAL_PAD_SECONDS = 0.4
+# Stop lets the sender finish the chunk it is sending; a socket stuck longer than
+# this is cancelled instead.
+SENDER_STOP_SECONDS = 3.0
 # systemctl stop: how long to let stopped recordings finish transcribing and paste.
 SHUTDOWN_FINISH_SECONDS = 20.0
 SHUTDOWN_MEDIA_SECONDS = 2.0
@@ -529,16 +532,19 @@ class MediaPauser:
             self.parked = []  # last chance for every player we still own
             self.cond.notify_all()
             while time.monotonic() < deadline:
-                if not self.owned:
-                    break
+                if not self.busy and not self.owned:
+                    break  # nothing in flight and nothing left to resume
                 if not self.busy and set(self.owned) <= set(self.parked):
                     break  # every attempt for them has failed again
                 self.cond.wait(timeout=0.05)
             left = list(self.owned)
+            in_flight = self.busy
         if left:
             names = ", ".join(p[len(self.MPRIS_PREFIX):] for p in left)
             print(f"⚠️  Could not resume playback before exit: {names}")
-        return not left
+        if in_flight:
+            print("⚠️  A media pause/resume was still running at exit")
+        return not left and not in_flight
 
     # --- worker thread ---------------------------------------------------
 
@@ -579,7 +585,9 @@ class MediaPauser:
         for player in self._players() or []:
             if not self._wanted():
                 break  # the recording already stopped: pause nothing more
-            if self._status(player) == "Playing" and self._call(player, "Pause"):
+            if self._status(player) != "Playing" or not self._wanted():
+                continue  # re-checked after the (slow) status read
+            if self._call(player, "Pause"):
                 with self.cond:
                     if player not in self.owned:
                         self.owned.append(player)  # recorded at once, not after the scan
@@ -1593,13 +1601,22 @@ class DictationApp:
 
             print("\n🛑 Recording stopped. Finalizing transcription...")
 
-            # Cancel sender task; any remaining buffered chunks are flushed in cleanup
+            # The sender loop ends by itself (is_recording is now False) after the
+            # chunk it is sending, so a send or commit is never cut in half. Only
+            # if that takes too long (a stuck socket) is it cancelled.
             if self.current_sender_task and not self.current_sender_task.done():
-                self.current_sender_task.cancel()
                 try:
-                    await self.current_sender_task  # Wait for cancellation to complete
+                    await asyncio.wait_for(
+                        asyncio.shield(self.current_sender_task), timeout=SENDER_STOP_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    self.current_sender_task.cancel()
+                    try:
+                        await self.current_sender_task
+                    except asyncio.CancelledError:
+                        pass
                 except asyncio.CancelledError:
-                    pass  # Expected
+                    pass
 
             # Stop capture so the mic releases, but keep the same PortAudio
             # stream object for the next session.
@@ -1649,10 +1666,15 @@ class DictationApp:
         self._refresh_indicator()
 
     def _refresh_indicator(self):
-        """One place decides the dot: recording > finishing > hidden."""
+        """One place decides the dot: recording > finishing > hidden.
+
+        While recording it does nothing: "recording" was sent when the recording
+        started, and sending it again would reset the live preview and cut short
+        a notice.
+        """
         if self.is_recording:
-            set_overlay_recording()
-        elif self.finalizers or self.stopping_sessions:
+            return
+        if self.finalizers or self.stopping_sessions:
             set_overlay_finalizing()
         else:
             hide_overlay()
@@ -1760,9 +1782,11 @@ class DictationApp:
         seconds = self.uncommitted_seconds.get(sid, 0.0) + len(audio_data) / (SAMPLE_RATE * 2)
         self.uncommitted_seconds[sid] = seconds
         if seconds >= FORCE_COMMIT_SECONDS:
-            await connection.commit()
+            # Count it before the send: once the frame may be on the wire it must
+            # be counted, even if the send is then interrupted.
             self.commits_sent[sid] = self.commits_sent.get(sid, 0) + 1
             self.uncommitted_seconds[sid] = 0.0
+            await connection.commit()
             print(f"✂️  Committed a {seconds:.0f}s piece (session {sid})")
 
     async def _commit_and_wait(self, connection, sid: int):
@@ -1779,9 +1803,9 @@ class DictationApp:
         await connection.send(
             {"audio_base_64": base64.b64encode(pad).decode("utf-8"), "sample_rate": SAMPLE_RATE}
         )
-        await connection.commit()
         self.commits_sent[sid] = self.commits_sent.get(sid, 0) + 1
         self.uncommitted_seconds[sid] = 0.0
+        await connection.commit()
         deadline = time.monotonic() + FINAL_TRANSCRIPT_MAX_SECONDS
         while self.commit_counts.get(sid, 0) < self.commits_sent[sid]:
             remaining = deadline - time.monotonic()
@@ -1962,8 +1986,7 @@ class DictationApp:
                 return
 
             # Step 4: Paste (run in executor: paste_text sleeps while injecting keys)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, paste_text, converted_text)
+            await _run_in_daemon_thread(paste_text, converted_text)
             log_transcript_stage(session_id, "paste.output", converted_text)
             print(f"\n✅ Pasted: {converted_text}\n")
             self.last_partial_text = ""
@@ -2057,17 +2080,8 @@ class DictationApp:
 
             log_transcript_stage(session_id, "event.committed", final_text)
 
-            # Deduplicate rapid repeated committed events for the same segment.
-            # Keep only near-identical repeats, allow same text later in long sessions.
-            now = time.monotonic()
-            last_committed = self.last_committed_text_by_session.get(session_id)
-            if last_committed:
-                last_text, last_time = last_committed
-                if last_text == final_text and (now - last_time) < 1.5:
-                    log_transcript_stage(session_id, "dedupe.skip", final_text)
-                    return
-            self.last_committed_text_by_session[session_id] = (final_text, now)
-
+            # No dedupe by text: Scribe answers each of our commits exactly once,
+            # and two pieces can legitimately say the same thing ("好", "好").
             segments = self.live_segments.setdefault(session_id, [])
             segments.append(final_text)
             if session_id not in self.stopping_sessions:

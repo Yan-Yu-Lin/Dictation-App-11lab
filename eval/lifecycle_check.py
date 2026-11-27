@@ -224,6 +224,85 @@ async def r4_r8():
     check("overlay hidden once everything is done", overlay[-1:] == ["hide"], overlay[-3:])
 
 
+class SlowCommitConnection(FakeConnection):
+    """commit() writes the frame first, then waits (like websockets' drain)."""
+
+    def __init__(self, *a, drain=0.5, **k):
+        super().__init__(*a, **k)
+        self.drain = drain
+        self.gaps = []
+        self.since_commit = 0.0
+        self.errors = []
+
+    async def send(self, data):
+        await super().send(data)
+        self.since_commit += len(dictation.base64.b64decode(data["audio_base_64"])) / 32000
+
+    async def commit(self):
+        if self.since_commit < 0.3:
+            self.errors.append("commit_throttled")
+        self.gaps.append(round(self.since_commit, 3))
+        self.since_commit = 0.0
+        await super().commit()  # frame is "on the wire" now
+        await asyncio.sleep(self.drain)  # ...then drain; stop may land here
+
+
+async def c1():
+    print("\n== C1 stop during a forced commit ==")
+    app = make_app("live")
+    pasted.clear()
+    sid = app.session_id + 1
+
+    async def no_connect(*a, **k):
+        raise RuntimeError("offline test")
+
+    app.elevenlabs.speech_to_text.realtime.connect = no_connect
+    app.mode = "batch"
+    await app.start_recording()
+    app.batch_sessions.discard(sid)
+    app.mode = "live"
+    conn = SlowCommitConnection(app, sid, [(0.05, "first part,"), (0.05, "second part")], drain=0.6)
+    app.connection = conn
+    # Queue 25.088 s + one more chunk (0.256 s), sent by the real sender task.
+    step = dictation.CHUNK_SIZE * 2
+    for _ in range(98):  # 98 * 0.256 s = 25.088 s
+        app.audio_queue.put_nowait(bytes(step))
+    app.current_sender_task = asyncio.create_task(app.send_audio_chunks(conn, app.audio_queue, sid))
+    await asyncio.sleep(0.3)  # sender has sent it all and is inside the forced commit's drain
+    app.audio_queue.put_nowait(bytes(step))  # one more chunk arrives
+    await app.stop_recording()
+    await settle(app)
+    check("no commit with < 0.3 s new audio", not conn.errors, (conn.gaps, conn.errors))
+    check("both pieces pasted once", pasted == ["first part, second part"], pasted)
+
+
+async def c2():
+    print("\n== C2 two pieces with the same text ==")
+    app = make_app("live")
+    pasted.clear()
+    await live_session(app, [(0.05, "好"), (0.06, "好")], audio_seconds=26)
+    await settle(app)
+    check("identical answers to two commits are both kept", pasted == ["好好"], pasted)
+
+
+def c5():
+    print("\n== C5 old finalizer done during a recording ==")
+    sent = []
+    real = (dictation.set_overlay_recording, dictation.set_overlay_finalizing, dictation.hide_overlay)
+    dictation.set_overlay_recording = lambda: sent.append("recording")
+    dictation.set_overlay_finalizing = lambda: sent.append("finalizing")
+    dictation.hide_overlay = lambda: sent.append("hide")
+    try:
+        app = make_app("live")
+        app.is_recording = True
+        app._refresh_indicator()
+        app.is_recording = False
+        app._refresh_indicator()
+    finally:
+        (dictation.set_overlay_recording, dictation.set_overlay_finalizing, dictation.hide_overlay) = real
+    check("refresh while recording sends nothing (preview kept)", sent == ["hide"], sent)
+
+
 async def b5():
     print("\n== B5 indicator transitions ==")
     app = make_app("batch")
@@ -451,6 +530,27 @@ def media():
     check("after retries run out, A is still owned", A in p.owned and bus.states[A] == "Paused", (p.owned, bus.states))
     bus.fail_play.clear()
 
+    # C3: restore while a Pause is still in flight (owned is empty but the worker is busy).
+    p2 = dictation.MediaPauser()
+    bus2 = FakeBus({A: "Playing"})
+    bus2.install(p2)
+    gate = threading.Event()
+    real_status = p2._status
+
+    def slow_status(player):
+        gate.wait(1.0)
+        return real_status(player)
+
+    p2._status = slow_status
+    p2.set_recording(True)
+    time.sleep(0.1)  # worker is now blocked in the status read
+    t0 = time.monotonic()
+    threading.Timer(0.3, gate.set).start()
+    ok2 = p2.restore(2.0)
+    took = time.monotonic() - t0
+    check("restore waits for an in-flight pause and leaves it playing",
+          ok2 and bus2.states[A] == "Playing" and took >= 0.25, (ok2, bus2.states, f"{took:.2f}s"))
+
     # Shutdown restore while still owning a paused player.
     ok = p.restore(2.0)
     check("restore at shutdown resumes it", ok and bus.states[A] == "Playing", bus.states)
@@ -463,6 +563,9 @@ async def main():
     dictation.event_loop = asyncio.get_running_loop()
     await r3()
     await r4_r8()
+    await c1()
+    await c2()
+    c5()
     await b5()
     b6()
     await r2()
