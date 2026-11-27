@@ -65,11 +65,14 @@ class FakeConnection:
 
     async def commit(self):
         self.commits += 1
+        self.sent_at_commit = getattr(self, "sent_at_commit", []) + [self.sent_seconds]
         if self.answers:
             delay, text = self.answers.pop(0)
-            asyncio.get_running_loop().call_later(
-                delay, self.app.on_committed_transcript, {"text": text}, self.sid
-            )
+            loop = asyncio.get_running_loop()
+            # Scribe answers commits in order: never before the previous answer.
+            at = max(loop.time() + delay, getattr(self, "last_answer_at", 0.0) + 0.01)
+            self.last_answer_at = at
+            loop.call_at(at, self.app.on_committed_transcript, {"text": text}, self.sid)
 
     async def close(self):
         self.closed = True
@@ -120,6 +123,7 @@ async def live_session(app, answers, held=(), audio_seconds=0.0):
     # Audio sent during the recording, through the real counting code.
     chunk = bytes(32000)  # 1 s
     for _ in range(int(audio_seconds)):
+        await conn.send({"audio_base_64": dictation.base64.b64encode(chunk).decode()})
         await app._count_sent_audio(conn, sid, chunk)
     app.last_connection = conn
     await app.stop_recording()
@@ -151,14 +155,15 @@ async def r3():
     await live_session(app, [(2.5, "a"), (0.2, "b"), (1.0, "c")], audio_seconds=60)
     await settle(app, limit=15)
     conn = app.last_connection
-    check("60 s: 3 commits, every answer kept", conn.commits == 3 and pasted == ["abc"], (conn.commits, pasted))
+    check("60 s: 3 commits, every answer kept, in order", conn.commits == 3 and pasted == ["abc"], (conn.commits, pasted))
 
     # The stop always sends >= 0.3 s of padding before its commit (no commit_throttled).
     pasted.clear()
     await live_session(app, [(0.05, "x")], audio_seconds=25)
     await settle(app)
     conn = app.last_connection
-    check("final commit always has >= 0.3 s new audio", conn.sent_seconds >= 25.3, conn.sent_seconds)
+    gaps = [b - a for a, b in zip([0.0] + conn.sent_at_commit, conn.sent_at_commit)]
+    check("every commit has >= 0.3 s new audio", all(g >= 0.3 for g in gaps), gaps)
 
     # Held pieces + a final tail that arrives late (3 s): included, one paste.
     pasted.clear()
@@ -398,6 +403,10 @@ def media():
     p.set_recording(True)
     time.sleep(0.4); wait_idle(p)
     check("quick stop+start ends paused", bus.states[A] == "Paused", bus.states)
+
+    # (the previous check ended mid-recording)
+    p.set_recording(False)
+    time.sleep(0.4); wait_idle(p)
 
     # B2: resume interrupted by a new recording: what was resumed is not "owned
     # and paused" any more, and the new scan pauses it again.
