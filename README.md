@@ -107,6 +107,25 @@ uv run python eval/mode_check.py --wav my.m4a   # your own recording
 uv run python eval/mode_check.py --long         # ~100 s live recording: one paste, at stop
 ```
 
+### Quieting music while you dictate
+
+While a recording is running, the app quiets whatever the Mac is playing (see `media_duck.py`):
+
+- **Speakers**: the output volume fades to silence in about 0.8 s, then the "now playing" app (Music, a browser tab, ...) is paused. When you stop, playback resumes and the volume fades back in over about 1.5 s.
+- **Headphones** (Bluetooth, or the headphone jack): the microphone cannot hear them, so the volume only drops to half and nothing is paused.
+- Nothing happens when the output is muted, nothing is playing, or the recording is shorter than 0.15 s.
+- If you change the volume yourself during a recording, your volume is kept.
+
+Pause/resume needs `brew install media-control`; without it only the volume is changed. Only the app macOS reports as "now playing" is paused; anything else that is playing just becomes silent for the length of the recording. Turn the whole feature off with `--no-duck`.
+
+Try it without recording anything:
+
+```bash
+uv run python media_duck.py --status                 # read-only: what would happen now
+uv run python media_duck.py --test                   # quiet for 3 s, then restore
+uv run python media_duck.py --test --as speakers     # try the speaker behaviour on headphones
+```
+
 ### Controls
 
 - **Cmd+Option+Control+D**: Toggle recording on/off (also works as Hyper Key + D if you have it configured)

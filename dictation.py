@@ -10,6 +10,7 @@ Two ways to transcribe, picked with --mode or Hyper+Shift+M:
 
 import argparse
 import array
+import signal
 import asyncio
 import base64
 import json
@@ -65,7 +66,9 @@ from elevenlabs import (
 from elevenlabs.realtime.connection import RealtimeConnection
 from Foundation import NSAttributedString, NSMakeRect, NSObject
 from pynput.keyboard import Controller, Key
-from PyObjCTools import AppHelper
+from PyObjCTools import AppHelper, MachSignals
+
+import media_duck
 
 # QuickMacHotKey for global hotkey interception (blocks keypress from reaching other apps)
 from quickmachotkey import mask, quickHotKey
@@ -172,6 +175,14 @@ event_loop = None  # Store reference to the event loop
 async_loop_ready = threading.Event()  # Signals when async loop is initialized
 status_overlay = None
 live_preview_enabled = bool(load_settings().get("live_preview", True))
+# Quiets music/videos while recording (see media_duck.py). Created in start_app, so
+# code that only imports this module (eval scripts) never touches the system volume.
+media_ducker = None
+
+
+def set_media_ducking(recording: bool):
+    if media_ducker:
+        media_ducker.set_recording(recording)
 
 
 def play_sound(sound_path, volume=0.25):
@@ -1074,6 +1085,7 @@ class DictationApp:
                 self.audio_stream.start_stream()
 
             play_sound(SOUND_START, SOUND_START_VOLUME)
+            set_media_ducking(True)
             set_overlay_recording()
             print("\n🎙️  Recording started. Listening now...")
             if batch:
@@ -1082,6 +1094,7 @@ class DictationApp:
                 print("🔄 Connecting to ElevenLabs realtime...")
         except Exception as e:
             print(f"❌ Error starting audio stream: {e}")
+            set_media_ducking(False)
             hide_overlay()
             if self.audio_stream is not None:
                 try:
@@ -1177,6 +1190,7 @@ class DictationApp:
             if current_session in self.stopping_sessions:
                 return
             hide_overlay()
+            set_media_ducking(False)
             self._stop_audio_stream()
             if self.active_session_id == current_session:
                 self.audio_queue = None
@@ -1194,6 +1208,7 @@ class DictationApp:
             if current_session in self.stopping_sessions:
                 return
             hide_overlay()
+            set_media_ducking(False)
             self._stop_audio_stream()
             if self.active_session_id == current_session:
                 self.audio_queue = None
@@ -1294,7 +1309,8 @@ class DictationApp:
             self.is_recording = False
             self.stopping_sessions.add(current_session)
 
-            # Play stop sound
+            # Bring playback back first, so the stop sound is not played into silence
+            set_media_ducking(False)
             play_sound(SOUND_STOP, SOUND_STOP_VOLUME)
             set_overlay_finalizing()
 
@@ -1981,9 +1997,26 @@ def setup_async_loop(chinese, model, mode):
     loop.run_forever()
 
 
-def start_app(chinese="tw", enable_right_shift_ptt=True, model="v3", mode=None):
+def start_app(
+    chinese="tw", enable_right_shift_ptt=True, model="v3", mode=None, duck_media=True
+):
     """Start the application with NSApplication event loop."""
-    global right_shift_ptt_enabled, right_shift_ptt_monitor
+    global right_shift_ptt_enabled, right_shift_ptt_monitor, media_ducker
+
+    if duck_media:
+        media_ducker = media_duck.MediaDucker()
+        print(
+            "Media ducking on: playback is quieted while recording "
+            f"(pause/resume {'available' if media_duck._media_control_path() else 'unavailable: brew install media-control'})"
+        )
+
+        # The Raycast toggle stops the app with SIGTERM. Put the volume back first,
+        # otherwise quitting mid-recording would leave the Mac silent.
+        def restore_and_quit(signum):
+            media_ducker.emergency_restore()
+            os._exit(0)
+
+        MachSignals.signal(signal.SIGTERM, restore_and_quit)
 
     right_shift_ptt_enabled = enable_right_shift_ptt
     right_shift_ptt_monitor = None
@@ -2026,6 +2059,8 @@ def start_app(chinese="tw", enable_right_shift_ptt=True, model="v3", mode=None):
             right_shift_ptt_monitor.stop()
         hide_overlay()
         status_overlay = None
+        if media_ducker:
+            media_ducker.emergency_restore()
         if app:
             app.cleanup()
 
@@ -2058,10 +2093,16 @@ if __name__ == "__main__":
         help="live = stream while you speak; batch = send the whole recording when you stop. "
         "Default: whatever was last picked with Hyper+Shift+M (live the first time)",
     )
+    parser.add_argument(
+        "--no-duck",
+        action="store_true",
+        help="Do not quiet music/videos while recording",
+    )
     args = parser.parse_args()
     start_app(
         chinese=args.chinese,
         enable_right_shift_ptt=not args.disable_right_shift_ptt,
         model=args.model,
         mode=args.mode,
+        duck_media=not args.no_duck,
     )
