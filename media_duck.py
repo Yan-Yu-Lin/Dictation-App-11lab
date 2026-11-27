@@ -4,7 +4,13 @@ When a recording starts and something is playing:
   * speakers:   fade the output volume down to silence, then pause the "now playing"
                 app (Music, a browser tab, ...) so it does not run on unheard.
   * headphones: the mic cannot hear them, so only lower the volume a little.
+  * headset:    Bluetooth headphones whose own microphone is doing the recording.
+                Using that mic drops the headphones into low-quality "call" sound,
+                so playback is paused, and resumed once the sound is back to normal.
 When the recording stops, playback is resumed and the volume fades back in.
+
+It also knows which microphone the app should use: the MacBook's built-in one, so
+that Bluetooth headphones never have to leave music quality (see pick_microphone).
 
 Nothing is touched when the output is muted or nothing is playing.
 
@@ -36,6 +42,8 @@ FADE_IN_JUMP_SECONDS = 0.12
 HEADPHONE_DUCK = 0.5  # headphones: lower to this share of the current volume
 STEP_SECONDS = 0.03
 VOLUME_TOLERANCE = 0.02  # the volume differs from ours by more than this = the user changed it
+MUSIC_SAMPLE_RATE = 44100  # Bluetooth output below this rate = headphones are in call mode
+CALL_MODE_WAIT_SECONDS = 4.0  # longest wait for headphones to go back to music quality
 
 # Processes that keep an output stream open all the time without playing anything.
 DEFAULT_IGNORED_APPS = ("com.apple.CoreSpeech", "com.joytap.app-setapp")
@@ -67,7 +75,7 @@ def _uncc(value) -> str:
         return ""
 
 
-_GLOBAL, _OUTPUT = _cc("glob"), _cc("outp")
+_GLOBAL, _OUTPUT, _INPUT = _cc("glob"), _cc("outp"), _cc("inpt")
 _SYSTEM_OBJECT = 1
 
 _ca.AudioObjectGetPropertyData.argtypes = [
@@ -124,8 +132,8 @@ def _get_string(obj: int, selector: str) -> str:
     return buffer.value.decode("utf-8", "replace") if ok else ""
 
 
-def _get_ids(obj: int, selector: str) -> list[int]:
-    addr = _Addr(_cc(selector), _GLOBAL, 0)
+def _get_ids(obj: int, selector: str, scope: int = _GLOBAL) -> list[int]:
+    addr = _Addr(_cc(selector), scope, 0)
     if not _ca.AudioObjectHasProperty(obj, ctypes.byref(addr)):
         return []
     size = ctypes.c_uint32(0)
@@ -164,6 +172,66 @@ def device_kind(device: int) -> str:
     if source == "hdpn" or "headphone" in name or "airpods" in name:
         return "headphones"
     return "speakers"
+
+
+def device_name(device: Optional[int]) -> str:
+    return _get_string(device, "lnam") if device else ""
+
+
+def is_bluetooth(device: Optional[int]) -> bool:
+    return bool(device) and _uncc(_get(device, "tran")) in ("blue", "blea")
+
+
+def same_headset(output_device: Optional[int], input_device: Optional[int]) -> bool:
+    """True when both are the two halves of one Bluetooth headset (e.g. AirPods)."""
+    if not (is_bluetooth(output_device) and is_bluetooth(input_device)):
+        return False
+    out_uid, in_uid = _get_string(output_device, "uid "), _get_string(input_device, "uid ")
+    # AirPods: "AA-BB-CC-DD-EE-FF:output" and "AA-BB-CC-DD-EE-FF:input"
+    if ":" in out_uid and ":" in in_uid:
+        return out_uid.rsplit(":", 1)[0] == in_uid.rsplit(":", 1)[0]
+    return device_name(output_device) == device_name(input_device)
+
+
+def output_sample_rate(device: int) -> Optional[float]:
+    return _get(device, "nsrt", _GLOBAL, ctypes.c_double)
+
+
+def default_input_device() -> Optional[int]:
+    return _get(_SYSTEM_OBJECT, "dIn ") or None
+
+
+def builtin_microphone() -> Optional[int]:
+    for device in _get_ids(_SYSTEM_OBJECT, "dev#"):
+        if _uncc(_get(device, "tran")) == "bltn" and _get_ids(device, "stm#", _INPUT):
+            return device
+    return None
+
+
+def lid_closed() -> bool:
+    """True when the MacBook lid is shut (its own microphone is switched off then)."""
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/ioreg", "-r", "-k", "AppleClamshellState", "-d", "4"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return '"AppleClamshellState" = Yes' in out
+
+
+def pick_microphone(prefer_builtin: bool = True) -> Optional[int]:
+    """The microphone a recording should use, without changing any system setting.
+
+    The MacBook's own microphone when the lid is open: recording from Bluetooth
+    headphones would switch them to call quality and wreck the music. Otherwise the
+    system's default input.
+    """
+    if prefer_builtin and not lid_closed():
+        builtin = builtin_microphone()
+        if builtin:
+            return builtin
+    return default_input_device()
 
 
 def apps_playing_audio(ignored: tuple[str, ...] = DEFAULT_IGNORED_APPS) -> list[str]:
@@ -225,6 +293,7 @@ class MediaDucker:
         self.log = log
         self._cond = threading.Condition()
         self._want = False  # True while a recording is running
+        self._mic: Optional[int] = None  # the microphone the current recording uses
         # What the worker last finished: True = quieted, False = restored,
         # None = a fade was cut short by a start/stop and has to be redone.
         self._at: Optional[bool] = False
@@ -235,9 +304,11 @@ class MediaDucker:
         recover_stale_state(log)
         threading.Thread(target=self._run, name="media-duck", daemon=True).start()
 
-    def set_recording(self, recording: bool):
+    def set_recording(self, recording: bool, microphone: Optional[int] = None):
         with self._cond:
             self._want = bool(recording)
+            if recording:
+                self._mic = microphone
             self._cond.notify_all()
 
     def is_idle(self) -> bool:
@@ -306,10 +377,14 @@ class MediaDucker:
             others = apps_playing_audio(self.ignored_apps)
             if not (media and media["playing"]) and not others:
                 return True  # nothing is playing
+            kind = device_kind(device)
+            if kind == "headphones" and same_headset(device, self._mic):
+                kind = "headset"  # their own mic is recording: pause, leave the volume
+                volume = None
             self._saved = {
                 "device": device,
                 "uid": _get_string(device, "uid "),
-                "kind": device_kind(device),
+                "kind": kind,
                 "volume": volume,
                 "muted_by_us": False,
                 "paused": "",
@@ -329,7 +404,7 @@ class MediaDucker:
                 return False  # stopped mid-fade; _restore brings the volume back
             if speakers and is_muted(device):
                 saved["muted_by_us"] = True  # some devices mute themselves at volume 0
-        if speakers and self._want and not saved["paused"]:
+        if saved["kind"] != "headphones" and self._want and not saved["paused"]:
             media = now_playing()
             if media and media["playing"] and _media_command("pause"):
                 saved["paused"] = media["bundle"] or "?"
@@ -359,6 +434,8 @@ class MediaDucker:
                 if not self._ramp(device, floor, FADE_IN_JUMP_SECONDS, want=False):
                     return False
         if saved["paused"]:
+            if saved["kind"] == "headset" and not self._wait_for_music_quality(device):
+                return False
             media = now_playing()
             if media and media["bundle"] == saved["paused"] and not media["playing"]:
                 _media_command("play")
@@ -369,6 +446,19 @@ class MediaDucker:
         self._last_set = None
         self._clear_state()
         self.log("🔊 Playback restored")
+        return True
+
+    def _wait_for_music_quality(self, device: int) -> bool:
+        """Wait until Bluetooth headphones are out of call mode, so the music does
+        not come back in phone-call quality. Returns False if a recording started."""
+        began = time.monotonic()
+        while time.monotonic() - began < CALL_MODE_WAIT_SECONDS:
+            if self._want or self._dead:
+                return False
+            rate = output_sample_rate(device)
+            if rate is None or rate >= MUSIC_SAMPLE_RATE:
+                break
+            time.sleep(0.1)
         return True
 
     # -- safety net ---------------------------------------------------------
@@ -450,6 +540,17 @@ def _status():
         f"output: {_get_string(device, 'lnam')!r} -> {device_kind(device)}, "
         f"volume {'no control' if volume is None else round(volume, 3)}, "
         f"muted {is_muted(device)}"
+    )
+    mic, system_mic = pick_microphone(), default_input_device()
+    print(
+        f"microphone the app would use: {device_name(mic)!r}"
+        f"{' (Bluetooth)' if is_bluetooth(mic) else ''} | system default input: "
+        f"{device_name(system_mic)!r} | lid closed: {lid_closed()}"
+    )
+    print(
+        f"output sample rate: {output_sample_rate(device)} | "
+        f"same headset as the app's mic: {same_headset(device, mic)}, "
+        f"as the system mic: {same_headset(device, system_mic)}"
     )
     print("now playing:", now_playing(), "| media-control:", _media_control_path())
     print("apps playing audio:", apps_playing_audio() or "none")

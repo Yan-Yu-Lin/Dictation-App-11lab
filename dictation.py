@@ -180,9 +180,9 @@ live_preview_enabled = bool(load_settings().get("live_preview", True))
 media_ducker = None
 
 
-def set_media_ducking(recording: bool):
+def set_media_ducking(recording: bool, microphone: Optional[int] = None):
     if media_ducker:
-        media_ducker.set_recording(recording)
+        media_ducker.set_recording(recording, microphone)
 
 
 def play_sound(sound_path, volume=0.25):
@@ -792,8 +792,12 @@ def paste_text(text):
 
 
 class DictationApp:
-    def __init__(self, chinese="tw", model="v3", mode="live"):
+    def __init__(self, chinese="tw", model="v3", mode="live", microphone="builtin"):
         self.profile = MODEL_PROFILES[model]
+        # "builtin" = always record with the MacBook's own microphone (falls back to
+        # the system default when the lid is closed); "system" = the system default.
+        self.microphone = microphone
+        self.audio_device_id: Optional[int] = None  # CoreAudio id of the open mic
         self.mode = mode  # "live" or "batch"; read when a recording starts
         self.batch_sessions: set[int] = set()  # sessions recorded in batch mode
         self.batch_tail: Optional[asyncio.Task] = None  # newest batch job (paste order)
@@ -873,18 +877,68 @@ class DictationApp:
         print(f"Press Cmd+Option+Control+{TRIGGER_KEY.upper()} to start/stop recording")
         print("(Or press your Hyper Key + D if you have it configured)\n")
 
-    def _ensure_audio_stream(self):
-        """Open the microphone stream once; restart this stream between sessions."""
-        if self.audio_stream is not None:
-            return
+    def _wanted_microphone(self) -> Optional[int]:
+        return media_duck.pick_microphone(prefer_builtin=self.microphone == "builtin")
 
+    def _input_device_index(self, name: str) -> Optional[int]:
+        """PortAudio index of the input device with this name, or None."""
+        if not name:
+            return None
+        for index in range(self.audio_interface.get_device_count()):
+            info = self.audio_interface.get_device_info_by_index(index)
+            if info.get("maxInputChannels", 0) > 0 and info.get("name") == name:
+                return index
+        return None
+
+    def _refresh_audio_devices(self):
+        """PortAudio lists devices once; start it again to see the current ones."""
+        self.audio_interface.terminate()
+        self.audio_interface = pyaudio.PyAudio()
+
+    def _ensure_audio_stream(self):
+        """Open the microphone stream once; restart this stream between sessions.
+
+        The stream is reopened only when the microphone to use has changed (the lid
+        was closed or opened, or the system default input changed).
+        """
+        if self.audio_stream is not None:
+            if self.audio_device_id is None:
+                return  # not opened by this method
+            wanted = self._wanted_microphone()
+            if wanted is None or wanted == self.audio_device_id:
+                return
+            print(
+                f"🎤 Microphone changed to {media_duck.device_name(wanted)!r}; "
+                "reopening the audio stream"
+            )
+            try:
+                self.audio_stream.close()
+            except Exception as e:
+                print(f"⚠️  Error closing audio stream: {e}")
+            self.audio_stream = None
+            self._refresh_audio_devices()
+
+        wanted = self._wanted_microphone()
+        name = media_duck.device_name(wanted)
+        index = self._input_device_index(name)
+        if name and index is None:
+            self._refresh_audio_devices()
+            index = self._input_device_index(name)
         self.audio_stream = self.audio_interface.open(
             format=AUDIO_FORMAT,
             channels=CHANNELS,
             rate=SAMPLE_RATE,
             input=True,
+            input_device_index=index,
             frames_per_buffer=CHUNK_SIZE,
             stream_callback=self.audio_callback,
+        )
+        self.audio_device_id = (
+            wanted if index is not None else media_duck.default_input_device()
+        )
+        print(
+            f"🎤 Microphone: {media_duck.device_name(self.audio_device_id) or 'system default'}"
+            f"{' (Bluetooth: playback is paused while recording)' if media_duck.is_bluetooth(self.audio_device_id) else ''}"
         )
 
     def _stop_audio_stream(self):
@@ -1085,7 +1139,7 @@ class DictationApp:
                 self.audio_stream.start_stream()
 
             play_sound(SOUND_START, SOUND_START_VOLUME)
-            set_media_ducking(True)
+            set_media_ducking(True, self.audio_device_id)
             set_overlay_recording()
             print("\n🎙️  Recording started. Listening now...")
             if batch:
@@ -1102,6 +1156,7 @@ class DictationApp:
                 except Exception:
                     pass
                 self.audio_stream = None
+                self.audio_device_id = None
             async with self.session_lock:
                 if self.active_session_id == current_session:
                     self.is_recording = False
@@ -1978,7 +2033,7 @@ class AppDelegate(NSObject):
         print("Press Ctrl+C to exit.\n")
 
 
-def setup_async_loop(chinese, model, mode):
+def setup_async_loop(chinese, model, mode, microphone):
     """Set up the async event loop in a separate thread."""
     global app, event_loop
 
@@ -1988,7 +2043,7 @@ def setup_async_loop(chinese, model, mode):
     event_loop = loop
 
     # Create app instance
-    app = DictationApp(chinese=chinese, model=model, mode=mode)
+    app = DictationApp(chinese=chinese, model=model, mode=mode, microphone=microphone)
 
     # Signal that initialization is complete
     async_loop_ready.set()
@@ -1998,7 +2053,12 @@ def setup_async_loop(chinese, model, mode):
 
 
 def start_app(
-    chinese="tw", enable_right_shift_ptt=True, model="v3", mode=None, duck_media=True
+    chinese="tw",
+    enable_right_shift_ptt=True,
+    model="v3",
+    mode=None,
+    duck_media=True,
+    microphone="builtin",
 ):
     """Start the application with NSApplication event loop."""
     global right_shift_ptt_enabled, right_shift_ptt_monitor, media_ducker
@@ -2029,7 +2089,7 @@ def start_app(
 
     # Start asyncio event loop in a separate thread
     async_thread = threading.Thread(
-        target=setup_async_loop, args=(chinese, model, mode), daemon=True
+        target=setup_async_loop, args=(chinese, model, mode, microphone), daemon=True
     )
     async_thread.start()
 
@@ -2098,6 +2158,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Do not quiet music/videos while recording",
     )
+    parser.add_argument(
+        "--mic",
+        choices=["builtin", "system"],
+        default="builtin",
+        help="builtin (default) = always record with the MacBook's own microphone, so "
+        "Bluetooth headphones keep music quality (system default input when the lid is "
+        "closed); system = follow the system's default input",
+    )
     args = parser.parse_args()
     start_app(
         chinese=args.chinese,
@@ -2105,4 +2173,5 @@ if __name__ == "__main__":
         model=args.model,
         mode=args.mode,
         duck_media=not args.no_duck,
+        microphone=args.mic,
     )

@@ -113,6 +113,7 @@ While a recording is running, the app quiets whatever the Mac is playing (see `m
 
 - **Speakers**: the output volume fades to silence in about 0.8 s, then the "now playing" app (Music, a browser tab, ...) is paused. When you stop, playback resumes and the volume fades back in over about 1.5 s.
 - **Headphones** (Bluetooth, or the headphone jack): the microphone cannot hear them, so the volume only drops to half and nothing is paused.
+- **Bluetooth headphones whose own microphone is recording** (only with `--mic system`, or with the lid closed): using that microphone drops the headphones into low-quality call sound, so playback is paused right away and the volume is left alone. Playback resumes once the headphones are back in music quality (at most 4 s after you stop).
 - Nothing happens when the output is muted, nothing is playing, or the recording is shorter than 0.15 s.
 - If you change the volume yourself during a recording, your volume is kept.
 
@@ -125,6 +126,15 @@ uv run python media_duck.py --status                 # read-only: what would hap
 uv run python media_duck.py --test                   # quiet for 3 s, then restore
 uv run python media_duck.py --test --as speakers     # try the speaker behaviour on headphones
 ```
+
+### Which microphone is used
+
+The app records with the **MacBook's own microphone**, whatever the system's default input is, and it does not change that system setting. This way AirPods and other Bluetooth headphones stay in music quality while you dictate (macOS switches them to call quality as soon as any app records from their microphone).
+
+- Lid closed (the built-in microphone is off then): the system's default input is used instead.
+- `--mic system`: always follow the system's default input.
+
+The microphone in use is printed in the log at the first recording (`🎤 Microphone: ...`).
 
 ### Controls
 
