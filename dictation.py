@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Dictation app using ElevenLabs Scribe v2 Realtime — Linux/Wayland (Hyprland) port.
+Dictation app using ElevenLabs Scribe (v3 Live / v3 batch) — Linux/Wayland (Hyprland) port.
 
 Runs as a background daemon. Wayland does not allow apps to grab global
 hotkeys, so control comes in over a unix socket instead:
 
     uv run dictation.py                # start the daemon
     python3 dictation-ctl.py toggle    # start/stop recording (bind this in Hyprland)
+    python3 dictation-ctl.py preview   # live preview on/off
+    python3 dictation-ctl.py mode      # live <-> batch
 
-Transcript pipeline: ElevenLabs commit -> OpenCC (s2t) -> character
-replacements -> artifact stripping -> paste at cursor (wl-copy + wtype).
-No punctuation model and no LLM post-processing.
+Transcript pipeline: Scribe text -> OpenCC (s2tw) -> character replacements ->
+per-sentence punctuation -> artifact stripping -> paste at cursor.
+No punctuation model and no LLM post-processing. Kept in step with the macOS
+version (branch main); the text functions are copied verbatim from it.
 """
 
 import argparse
@@ -22,11 +25,14 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty, Full
 from typing import Optional
 
@@ -61,12 +67,41 @@ CHANNELS = 1  # Mono
 MAX_AUDIO_QUEUE_CHUNKS = 120  # ~30s of buffered audio at CHUNK_SIZE=4096
 CONNECT_TIMEOUT_SECONDS = 8.0
 FINAL_TRANSCRIPT_TIMEOUT_SECONDS = 2.5
+# Batch mode: one HTTP request per recording, sent after you stop.
+MODES = ("live", "batch")
+BATCH_MIN_TIMEOUT_SECONDS = 20  # longer recordings get 10 s + half their length
+BATCH_ATTEMPTS = 2  # the audio is still in memory, so a failed request is retried once
 TRANSCRIPT_DEBUG_LOG = os.getenv("DICTATION_TRANSCRIPT_DEBUG", "1") != "0"
 CHARACTER_REPLACEMENTS_PATH = os.path.join(
     os.path.dirname(__file__), "character_replacements.json"
 )
 DEFAULT_CHARACTER_REPLACEMENTS = {
     "纔": "才",
+}
+KEYTERMS_PATH = os.path.join(os.path.dirname(__file__), "keyterms.json")
+# Realtime keyterm limits (ElevenLabs docs): max 50 terms, 1000 chars total.
+KEYTERMS_MAX_COUNT = 50
+KEYTERMS_MAX_TOTAL_CHARS = 1000
+
+# Model profiles, picked with --model (same as the macOS version).
+#   v2: the original setup, kept unchanged as a fallback.
+#   v3: Scribe v3 Live / Scribe v3 + keyterms.json + OpenCC s2tw (Taiwan characters:
+#       裡/才/啟/著 instead of s2t's 裏/纔/啓/着).
+MODEL_PROFILES = {
+    "v2": {
+        "model_id": "scribe_v2_realtime",
+        "batch_model_id": "scribe_v2",
+        "label": "Scribe v2 Realtime",
+        "opencc_config": "s2t",
+        "use_keyterms": False,
+    },
+    "v3": {
+        "model_id": "scribe_v3_live",
+        "batch_model_id": "scribe_v3",
+        "label": "Scribe v3 Live",
+        "opencc_config": "s2tw",
+        "use_keyterms": True,
+    },
 }
 TRAILING_STRIP_CHARS = "。"
 TRAILING_CUTOFF_DASH_CHARS = "-–—"
@@ -97,9 +132,39 @@ TERMINAL_CLASSES = {
     "xterm",
 }
 
+# Live preview on/off and live/batch mode, kept across restarts.
+SETTINGS_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "dictation-app",
+    "settings.json",
+)
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(settings: dict):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as file:
+            json.dump(settings, file, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"⚠️  Could not save settings: {e}")
+
+
 # Global state
 event_loop = None  # Store reference to the event loop
 status_notifier = None
+live_preview_enabled = bool(load_settings().get("live_preview", True))
+# Pauses music/videos while recording (MediaPauser below). Created in run_daemon,
+# so code that only imports this module never touches the media players.
+media_pauser = None
 
 
 def silence_alsa_errors():
@@ -183,6 +248,21 @@ class StatusNotifier:
     def show_partial(self, text: str):
         pass  # Live preview only makes sense on the floating dot
 
+    def show_notice(self, text: str):
+        if not self.enabled:
+            return
+        try:
+            subprocess.Popen(
+                ["notify-send", "-a", "Dictation", "-t", "1500", text],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def set_preview(self, enabled: bool):
+        pass
+
     def hide(self):
         if not self.enabled or self.notification_id is None:
             return
@@ -260,6 +340,12 @@ class DotOverlay:
     def show_partial(self, text: str):
         self._send("partial " + text.replace("\n", " "))
 
+    def show_notice(self, text: str):
+        self._send("notice " + text.replace("\n", " "))
+
+    def set_preview(self, enabled: bool):
+        self._send("preview " + ("on" if enabled else "off"))
+
     def hide(self):
         self._send("hide")
 
@@ -275,11 +361,118 @@ def create_status_indicator():
     """Prefer the floating dot; fall back to desktop notifications."""
     try:
         overlay = DotOverlay()
+        overlay.set_preview(live_preview_enabled)
         print("🔴 Status indicator: floating dot (layer-shell)")
         return overlay
     except Exception as e:
         print(f"⚠️  Floating dot unavailable ({e}); using notifications")
         return StatusNotifier()
+
+
+def show_overlay_notice(text: str):
+    if status_notifier:
+        status_notifier.show_notice(text)
+
+
+class MediaPauser:
+    """Pauses whatever is playing while you record, and resumes it afterwards.
+
+    Linux counterpart of the macOS media_duck.py, kept simple on purpose: every
+    MPRIS player (browsers, Spotify, mpv, ...) that is Playing when a recording
+    starts is paused, and exactly those players are resumed when it stops.
+    Players that were already paused are left alone. Talks to D-Bus through
+    `gdbus`, which ships with glib2, so nothing extra has to be installed.
+    Recordings shorter than RESUME_MIN_SECONDS still resume normally; the pause
+    itself is skipped for nothing (pausing is cheap and instant).
+    """
+
+    MPRIS_PREFIX = "org.mpris.MediaPlayer2."
+    OBJECT_PATH = "/org/mpris/MediaPlayer2"
+
+    def __init__(self):
+        self.enabled = shutil.which("gdbus") is not None
+        self.paused_by_us: list[str] = []
+        self.lock = threading.Lock()
+        if not self.enabled:
+            print("⚠️  gdbus not found; media pausing disabled")
+
+    def _gdbus(self, *args, timeout=1.0) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["gdbus", "call", "--session", *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return result.stdout if result.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _players(self) -> list[str]:
+        out = self._gdbus(
+            "--dest", "org.freedesktop.DBus",
+            "--object-path", "/org/freedesktop/DBus",
+            "--method", "org.freedesktop.DBus.ListNames",
+        )
+        if not out:
+            return []
+        return re.findall(r"'(org\.mpris\.MediaPlayer2\.[^']+)'", out)
+
+    def _status(self, player: str) -> str:
+        out = self._gdbus(
+            "--dest", player,
+            "--object-path", self.OBJECT_PATH,
+            "--method", "org.freedesktop.DBus.Properties.Get",
+            "org.mpris.MediaPlayer2.Player", "PlaybackStatus",
+        )
+        match = re.search(r"'(\w+)'", out or "")
+        return match.group(1) if match else ""
+
+    def _call(self, player: str, method: str):
+        self._gdbus(
+            "--dest", player,
+            "--object-path", self.OBJECT_PATH,
+            "--method", f"org.mpris.MediaPlayer2.Player.{method}",
+        )
+
+    def pause_playing(self):
+        """Pause every player that is playing right now (runs in a worker thread)."""
+        if not self.enabled:
+            return
+        with self.lock:
+            paused = []
+            for player in self._players():
+                if self._status(player) == "Playing":
+                    self._call(player, "Pause")
+                    paused.append(player)
+            self.paused_by_us = paused
+            if paused:
+                names = ", ".join(p[len(self.MPRIS_PREFIX):] for p in paused)
+                print(f"⏸️  Paused playback: {names}")
+
+    def resume(self):
+        """Resume exactly the players this recording paused (worker thread)."""
+        if not self.enabled:
+            return
+        with self.lock:
+            players, self.paused_by_us = self.paused_by_us, []
+            for player in players:
+                # Someone may have pressed play/stop meanwhile; only resume a still-paused one.
+                if self._status(player) == "Paused":
+                    self._call(player, "Play")
+            if players:
+                print(f"▶️  Resumed playback ({len(players)} player(s))")
+
+
+# One worker so pause and resume always run in the order they were asked for.
+_media_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media")
+
+
+def set_media_paused(recording: bool):
+    if media_pauser:
+        _media_executor.submit(
+            media_pauser.pause_playing if recording else media_pauser.resume
+        )
 
 
 def set_overlay_recording():
@@ -359,6 +552,133 @@ def strip_trailing_final_punctuation(text: str) -> str:
             break
 
     return stripped
+
+
+CJK_CHAR_RE = re.compile(r"[㐀-鿿豈-﫿぀-ヿ]")
+LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
+LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’-]*")
+FULL_TO_HALF_PUNCT = {"，": ",", "。": ".", "？": "?", "！": "!", "；": ";", "：": ":"}
+HALF_TO_FULL_PUNCT = {",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "："}
+SENTENCE_END_FULL = "。？！"
+SENTENCE_END_HALF = ".?!"
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    """Split into sentences: after 。？！ / newline, or after .?! followed by space or end."""
+    spans = []
+    start = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        boundary = c in SENTENCE_END_FULL or c == "\n" or (
+            c in SENTENCE_END_HALF and (i + 1 == n or text[i + 1].isspace())
+        )
+        if boundary:
+            j = i + 1
+            while j < n and text[j] in SENTENCE_END_FULL + SENTENCE_END_HALF:
+                j += 1
+            spans.append((start, j))
+            start = i = j
+        else:
+            i += 1
+    if start < n:
+        spans.append((start, n))
+    return spans
+
+
+def _half_mark_belongs_to_chinese(text: str, k: int) -> bool:
+    """Should the half-width mark at k become full-width (it sits in a Chinese sentence)?"""
+    c = text[k]
+    j = k + 1
+    while j < len(text) and text[j] == " ":
+        j += 1
+    nxt = text[j] if j < len(text) else ""
+    next_is_cjk = bool(nxt) and bool(CJK_CHAR_RE.match(nxt))
+    if c in ".?!":
+        # A whole English clause ending here ("上面—— Your agent needs your input. 上面有…")
+        # keeps its own mark; a word or two inside Chinese ("變成 DGX?") gets the Chinese one.
+        before = text[:k]
+        last_cjk = max((m.end() for m in CJK_CHAR_RE.finditer(before)), default=0)
+        if len(LATIN_WORD_RE.findall(before[last_cjk:])) >= 3:
+            return False
+        if c == ".":
+            return next_is_cjk  # keeps 3.5, Node.js
+        return next_is_cjk or not nxt
+    # , ; : only when Chinese follows: keeps 10:30 and "DGX, Spark" as they are
+    return next_is_cjk
+
+
+def normalize_mixed_punctuation(text: str) -> str:
+    """English sentences get English punctuation, Chinese sentences get Chinese punctuation.
+
+    Scribe picks the punctuation style per stretch of speech, so a short English sentence said
+    between Chinese ones comes back as "Yeah，as expected，which is a good thing". The language is
+    decided per sentence, not per word: a Chinese sentence that contains English words
+    ("我剛剛選擇 GitHub Mobile，然後…") keeps its full-width marks.
+      * sentence with Latin letters and no CJK: ，。？！；： -> , . ? ! ; : (plus a space before the next word)
+      * sentence with CJK: , ; : . -> full-width when Chinese follows; ? ! -> full-width at the end too
+    """
+    if not text:
+        return text
+    english_at = [False] * len(text)
+    chinese_at = [False] * len(text)
+    for s, e in _sentence_spans(text):
+        segment = text[s:e]
+        has_cjk = bool(CJK_CHAR_RE.search(segment))
+        is_english = not has_cjk and bool(LATIN_CHAR_RE.search(segment))
+        for k in range(s, e):
+            english_at[k] = is_english
+            chinese_at[k] = has_cjk
+
+    out: list[str] = []
+    skip_spaces = False
+    for k, c in enumerate(text):
+        if skip_spaces:
+            if c == " ":
+                continue
+            skip_spaces = False
+        nxt = text[k + 1] if k + 1 < len(text) else ""
+        if english_at[k] and c in FULL_TO_HALF_PUNCT:
+            out.append(FULL_TO_HALF_PUNCT[c])
+            if nxt and not nxt.isspace() and nxt not in FULL_TO_HALF_PUNCT and nxt not in HALF_TO_FULL_PUNCT:
+                out.append(" ")
+        elif chinese_at[k] and c in HALF_TO_FULL_PUNCT and _half_mark_belongs_to_chinese(text, k):
+            while out and out[-1] == " ":
+                out.pop()
+            out.append(HALF_TO_FULL_PUNCT[c])
+            skip_spaces = True
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def join_live_segments(segments: list[str]) -> str:
+    """Join the pieces Scribe Live committed during one recording into one text.
+
+    A long live recording comes back in several pieces, because Scribe commits
+    on its own about every 35 s. A piece that was cut mid-sentence ends with a
+    dash marker; the marker is dropped. A space is added only where an English
+    word meets the next word, the way Scribe spaces text inside one piece.
+    """
+    joined = ""
+    for segment in segments:
+        segment = segment.strip()
+        if not segment:
+            continue
+        joined = joined.rstrip(TRAILING_CUTOFF_DASH_CHARS).rstrip()
+        if not joined:
+            joined = segment
+            continue
+        prev, nxt = joined[-1], segment[0]
+        prev_latin = prev.isascii() and (prev.isalnum() or prev in ".,?!;:")
+        next_latin = nxt.isascii() and nxt.isalnum()
+        prev_cjk = bool(CJK_CHAR_RE.match(prev))
+        next_cjk = bool(CJK_CHAR_RE.match(nxt))
+        if (prev_latin and (next_latin or next_cjk)) or (prev_cjk and next_latin):
+            joined += " "
+        joined += segment
+    return joined
 
 
 def sanitize_for_paste(text: str) -> str:
@@ -545,7 +865,14 @@ def paste_text(text):
 
 
 class DictationApp:
-    def __init__(self, chinese="tw"):
+    def __init__(self, chinese="tw", model="v3", mode="live"):
+        self.profile = MODEL_PROFILES[model]
+        self.mode = mode  # "live" or "batch"; read when a recording starts
+        self.batch_sessions: set[int] = set()  # sessions recorded in batch mode
+        self.batch_tail: Optional[asyncio.Task] = None  # newest batch job (paste order)
+        # Live mode: text Scribe committed while still recording, pasted at stop.
+        self.live_segments: dict[int, list[str]] = {}
+        self.paste_tasks: set[asyncio.Task] = set()
         self.is_recording = False
         self.audio_stream = None
         self.audio_interface = None
@@ -578,10 +905,13 @@ class DictationApp:
         # s2t: Simplified to Traditional, t2s: Traditional to Simplified
         self.chinese_variant = chinese
         if chinese == "tw":
-            self.chinese_converter = opencc.OpenCC("s2t")
+            self.chinese_converter = opencc.OpenCC(self.profile["opencc_config"])
         else:
             self.chinese_converter = opencc.OpenCC("t2s")
         self.character_replacement_items = self._load_character_replacements()
+        self.keyterms = (
+            self._load_keyterms() if self.profile["use_keyterms"] else []
+        )
 
         # Initialize ElevenLabs client
         elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
@@ -603,11 +933,21 @@ class DictationApp:
 
         print("Dictation App Ready!")
         print(
+            f"Model: {self.profile['label']} ({self.profile['model_id']}), "
+            f"OpenCC: {self.profile['opencc_config']}, keyterms: {len(self.keyterms)}"
+        )
+        print(
+            f"Mode: {self.mode} "
+            f"(live = {self.profile['model_id']}, batch = {self.profile['batch_model_id']})"
+        )
+        print(
             f"Chinese output: {'Traditional (TW)' if chinese == 'tw' else 'Simplified (CN)'}"
         )
-        print("Punctuation post-processing: none (raw Scribe v2 output)")
         print(f"Control socket: {SOCKET_PATH}")
-        print("Toggle with: python3 dictation-ctl.py toggle (Hyper+D in Hyprland)\n")
+        print(
+            "Control: dictation-ctl.py toggle (Hyper+D) | preview (Hyper+Shift+D) "
+            "| mode (Hyper+Shift+M)\n"
+        )
 
     def _ensure_audio_stream(self):
         """Open the microphone stream once; restart this stream between sessions."""
@@ -665,6 +1005,43 @@ class DictationApp:
         )
         print(f"🔤 Character replacements loaded: {len(replacement_items)}")
         return replacement_items
+
+    def _load_keyterms(self) -> list[str]:
+        """Load keyterms.json (a JSON list of strings) within realtime limits."""
+        try:
+            with open(KEYTERMS_PATH, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            if not isinstance(loaded, list) or not all(
+                isinstance(term, str) for term in loaded
+            ):
+                raise ValueError("keyterms.json must be a JSON list of strings")
+        except FileNotFoundError:
+            print("⚠️  keyterms.json not found; running without keyterms")
+            return []
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            print(f"⚠️  Failed to load keyterms.json ({e}); running without keyterms")
+            return []
+
+        terms: list[str] = []
+        total_chars = 0
+        for term in (t.strip() for t in loaded):
+            if not term or term in terms:
+                continue
+            if (
+                len(terms) >= KEYTERMS_MAX_COUNT
+                or total_chars + len(term) > KEYTERMS_MAX_TOTAL_CHARS
+            ):
+                print(
+                    f"⚠️  keyterms.json over the realtime limit "
+                    f"({KEYTERMS_MAX_COUNT} terms / {KEYTERMS_MAX_TOTAL_CHARS} chars); "
+                    f"ignoring from '{term}' on"
+                )
+                break
+            terms.append(term)
+            total_chars += len(term)
+
+        print(f"🎯 Keyterms loaded: {len(terms)} ({total_chars} chars)")
+        return terms
 
     def apply_character_replacements(self, text: str) -> str:
         """Apply literal character replacements using longest match first.
@@ -767,8 +1144,14 @@ class DictationApp:
             self.session_peak_audio[current_session] = 0
             self.session_rms_sum[current_session] = 0.0
 
-            # Create a NEW queue for this session (isolates from previous sessions)
-            self.audio_queue = Queue(maxsize=MAX_AUDIO_QUEUE_CHUNKS)
+            # The mode is fixed for the whole recording, even if it is switched meanwhile.
+            batch = self.mode == "batch"
+            if batch:
+                self.batch_sessions.add(current_session)
+
+            # Create a NEW queue for this session (isolates from previous sessions).
+            # Batch keeps the whole recording, so its queue has no size limit.
+            self.audio_queue = Queue(maxsize=0 if batch else MAX_AUDIO_QUEUE_CHUNKS)
             self.audio_queue_session_id = current_session
 
         # Start the existing stream object instead of closing/re-opening the
@@ -779,11 +1162,16 @@ class DictationApp:
                 self.audio_stream.start_stream()
 
             play_sound(SOUND_START, SOUND_START_VOLUME)
+            set_media_paused(True)
             set_overlay_recording()
             print("\n🎙️  Recording started. Listening now...")
-            print("🔄 Connecting to ElevenLabs realtime...")
+            if batch:
+                print("📼 Batch mode: audio is sent when you stop")
+            else:
+                print("🔄 Connecting to ElevenLabs realtime...")
         except Exception as e:
             print(f"❌ Error starting audio stream: {e}")
+            set_media_paused(False)
             hide_overlay()
             if self.audio_stream is not None:
                 try:
@@ -798,7 +1186,11 @@ class DictationApp:
                     self.audio_queue = None
                     self.audio_queue_session_id = None
                 self.commit_events.pop(current_session, None)
+                self.batch_sessions.discard(current_session)
             return
+
+        if batch:
+            return  # nothing to connect; stop_recording sends the audio
 
         # Connect to ElevenLabs Realtime API (outside lock to keep hotkey responsive)
         try:
@@ -808,23 +1200,25 @@ class DictationApp:
                     "Realtime client unavailable in current ElevenLabs SDK"
                 )
 
-            if not getattr(realtime_client, "_dictation_no_verbatim_patch", False):
+            if not getattr(realtime_client, "_dictation_url_patch", False):
                 original_build_websocket_url = realtime_client._build_websocket_url
+                # SDK 2.45 has no options for these, so append them to the URL.
+                extra_query = [("no_verbatim", "true")] + [
+                    ("keyterms", term) for term in self.keyterms
+                ]
 
-                def build_websocket_url_with_no_verbatim(*args, **kwargs):
+                def build_websocket_url_with_extras(*args, **kwargs):
                     url = original_build_websocket_url(*args, **kwargs)
                     separator = "&" if "?" in url else "?"
-                    return f"{url}{separator}no_verbatim=true"
+                    return f"{url}{separator}{urllib.parse.urlencode(extra_query)}"
 
-                realtime_client._build_websocket_url = (
-                    build_websocket_url_with_no_verbatim
-                )
-                realtime_client._dictation_no_verbatim_patch = True
+                realtime_client._build_websocket_url = build_websocket_url_with_extras
+                realtime_client._dictation_url_patch = True
 
             connect_task = asyncio.create_task(
                 realtime_client.connect(
                     RealtimeAudioOptions(
-                        model_id="scribe_v2_realtime",
+                        model_id=self.profile["model_id"],
                         audio_format=AudioFormat.PCM_16000,
                         sample_rate=SAMPLE_RATE,
                         commit_strategy=CommitStrategy.MANUAL,
@@ -873,6 +1267,7 @@ class DictationApp:
             if current_session in self.stopping_sessions:
                 return
             hide_overlay()
+            set_media_paused(False)
             self._stop_audio_stream()
             if self.active_session_id == current_session:
                 self.audio_queue = None
@@ -890,6 +1285,7 @@ class DictationApp:
             if current_session in self.stopping_sessions:
                 return
             hide_overlay()
+            set_media_paused(False)
             self._stop_audio_stream()
             if self.active_session_id == current_session:
                 self.audio_queue = None
@@ -990,8 +1386,9 @@ class DictationApp:
             self.is_recording = False
             self.stopping_sessions.add(current_session)
 
-            # Play stop sound
+            # Play stop sound, then bring playback back
             play_sound(SOUND_STOP, SOUND_STOP_VOLUME)
+            set_media_paused(False)
             set_overlay_finalizing()
 
             print("\n🛑 Recording stopped. Finalizing transcription...")
@@ -1026,6 +1423,14 @@ class DictationApp:
             self.audio_queue = None
             self.audio_queue_session_id = None
             self.current_sender_task = None
+
+            if current_session in self.batch_sessions:
+                self.batch_tail = asyncio.create_task(
+                    self._finish_batch_session(
+                        old_audio_queue, current_session, self.batch_tail
+                    )
+                )
+                return
 
             # Clean up old session asynchronously in background and remember task
             self.cleanup_task = asyncio.create_task(
@@ -1123,35 +1528,167 @@ class DictationApp:
                                 "⚠️  Final transcript event timed out; closing session"
                             )
 
+                except Exception as e:
+                    print(f"⚠️  Error finalizing transcript: {e}")
+
+            # Paste the whole recording in one go: the pieces Scribe committed
+            # on its own while you were still talking, plus the final piece.
+            self._paste_held_segments(session_to_cleanup)
+
+            if connection:
+                try:
                     await connection.close()
                 except Exception as e:
                     print(f"⚠️  Error closing connection: {e}")
+                # A final piece that came in late (after the wait above timed
+                # out) is still pasted instead of being thrown away.
+                self._paste_held_segments(session_to_cleanup)
 
             print("✅ Transcription complete!\n")
         except Exception as e:
             print(f"⚠️  Error during cleanup: {e}")
         finally:
-            self.commit_events.pop(session_to_cleanup, None)
-            self.last_committed_text_by_session.pop(session_to_cleanup, None)
-            self.connect_tasks.pop(session_to_cleanup, None)
-            self.stopping_sessions.discard(session_to_cleanup)
-            self.registered_connection_sessions.discard(session_to_cleanup)
-            self.session_started_sessions.discard(session_to_cleanup)
-            self.audio_callback_counts.pop(session_to_cleanup, None)
-            self.audio_drop_counts.pop(session_to_cleanup, None)
-            self.sender_chunk_counts.pop(session_to_cleanup, None)
-            self.session_peak_audio.pop(session_to_cleanup, None)
-            self.session_rms_sum.pop(session_to_cleanup, None)
-            self.sender_first_send_at.pop(session_to_cleanup, None)
-            # Clear active session only if this cleanup belongs to the active one
-            if self.active_session_id == session_to_cleanup:
-                self.active_session_id = None
-                hide_overlay()
-            elif not self.is_recording:
-                hide_overlay()
+            self._forget_session(session_to_cleanup)
             # Reset reference to this cleanup task
             if self.cleanup_task is asyncio.current_task():
                 self.cleanup_task = None
+
+    def _paste_held_segments(self, session_id: int):
+        """Paste everything a live session has committed so far, as one text."""
+        segments = self.live_segments.pop(session_id, [])
+        if not segments:
+            return
+        if len(segments) > 1:
+            print(f"🧩 Joining {len(segments)} pieces (session {session_id})")
+        paste_task = asyncio.create_task(
+            self._process_final_transcript(join_live_segments(segments), session_id)
+        )
+        self.paste_tasks.add(paste_task)
+        paste_task.add_done_callback(self.paste_tasks.discard)
+
+    def _forget_session(self, session_id: int):
+        """Drop a finished session's bookkeeping and hide the overlay if it is idle."""
+        self.commit_events.pop(session_id, None)
+        self.last_committed_text_by_session.pop(session_id, None)
+        self.connect_tasks.pop(session_id, None)
+        self.stopping_sessions.discard(session_id)
+        self.registered_connection_sessions.discard(session_id)
+        self.session_started_sessions.discard(session_id)
+        self.batch_sessions.discard(session_id)
+        self.live_segments.pop(session_id, None)
+        self.audio_callback_counts.pop(session_id, None)
+        self.audio_drop_counts.pop(session_id, None)
+        self.sender_chunk_counts.pop(session_id, None)
+        self.session_peak_audio.pop(session_id, None)
+        self.session_rms_sum.pop(session_id, None)
+        self.sender_first_send_at.pop(session_id, None)
+        # Clear active session only if this cleanup belongs to the active one
+        if self.active_session_id == session_id:
+            self.active_session_id = None
+            hide_overlay()
+        elif not self.is_recording:
+            hide_overlay()
+
+    def _batch_request(self, pcm: bytes, timeout_seconds: int) -> str:
+        """One blocking batch request (runs in a worker thread)."""
+        extra = {"keyterms": self.keyterms} if self.keyterms else {}
+        response = self.elevenlabs.speech_to_text.convert(
+            model_id=self.profile["batch_model_id"],
+            file=("dictation.pcm", pcm, "application/octet-stream"),
+            file_format="pcm_s16le_16",  # raw 16 kHz mono PCM, same as the mic stream
+            tag_audio_events=False,
+            no_verbatim=True,
+            request_options={"timeout_in_seconds": timeout_seconds},
+            **extra,
+        )
+        return (getattr(response, "text", "") or "").strip()
+
+    async def _transcribe_batch(self, pcm: bytes, session_id: int) -> Optional[str]:
+        """Send one recording to the batch API. Returns None when it failed."""
+        duration = len(pcm) / (SAMPLE_RATE * 2)
+        timeout_seconds = int(max(BATCH_MIN_TIMEOUT_SECONDS, 10 + duration / 2))
+        loop = asyncio.get_running_loop()
+        for attempt in range(1, BATCH_ATTEMPTS + 1):
+            started = time.monotonic()
+            try:
+                text = await loop.run_in_executor(
+                    None, self._batch_request, pcm, timeout_seconds
+                )
+            except Exception as e:
+                status = getattr(e, "status_code", None)
+                detail = (
+                    f"HTTP {status}: {getattr(e, 'body', '')}"
+                    if status is not None
+                    else f"{type(e).__name__}: {e}"
+                )
+                print(
+                    f"❌ Batch transcription failed (session {session_id}, "
+                    f"attempt {attempt}/{BATCH_ATTEMPTS}, "
+                    f"{time.monotonic() - started:.2f}s): {detail[:300]}"
+                )
+                # A 4xx (bad key, bad request) will not get better on a second try.
+                retryable = status is None or status >= 500 or status in (408, 429)
+                if not retryable or attempt == BATCH_ATTEMPTS:
+                    return None
+                await asyncio.sleep(0.5)
+            else:
+                print(
+                    f"📨 Batch transcript received (session {session_id}, "
+                    f"audio={duration:.1f}s, took {time.monotonic() - started:.2f}s)"
+                )
+                return text
+        return None
+
+    async def _finish_batch_session(
+        self,
+        audio_queue: Optional[Queue],
+        session_id: int,
+        previous: Optional[asyncio.Task] = None,
+    ):
+        """Batch mode: send the whole recording in one request, then paste."""
+        try:
+            text: Optional[str] = ""
+            try:
+                chunks = []
+                while audio_queue is not None:
+                    try:
+                        chunks.append(audio_queue.get_nowait())
+                    except Empty:
+                        break
+                pcm = b"".join(chunks)
+                if pcm:
+                    samples = array.array("h")
+                    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+                    if sys.byteorder != "little":
+                        samples.byteswap()
+                    peak = max(max(samples), -min(samples)) if samples else 0
+                    print(
+                        f"📤 Sending {len(pcm) / (SAMPLE_RATE * 2):.1f}s of audio to "
+                        f"{self.profile['batch_model_id']} "
+                        f"(session {session_id}, peak={peak})"
+                    )
+                    text = await self._transcribe_batch(pcm, session_id)
+                else:
+                    print(f"🧹 No audio captured (session {session_id})")
+            finally:
+                self._forget_session(session_id)
+
+            # Longer recordings take longer to come back; keep the paste order.
+            if previous is not None and not previous.done():
+                await asyncio.wait({previous})
+
+            if text is None:
+                show_overlay_notice("轉錄失敗")
+                print("❌ Nothing pasted: batch transcription failed\n")
+                return
+            if text:
+                log_transcript_stage(session_id, "event.batch", text)
+                await self._process_final_transcript(text, session_id)
+            else:
+                print("🧹 Suppressed empty/no-speech transcript")
+            print("✅ Transcription complete!\n")
+        except Exception as e:
+            print(f"⚠️  Error during batch transcription (session {session_id}): {e}")
 
     async def _process_final_transcript(self, text: str, session_id: int):
         """Process final transcript: convert characters, clean artifacts, paste."""
@@ -1168,12 +1705,26 @@ class DictationApp:
                 session_id, "after.character_replacements", converted_text
             )
 
+            # Step 2b: English sentences get English punctuation, Chinese ones Chinese.
+            normalized_text = normalize_mixed_punctuation(converted_text)
+            if normalized_text != converted_text:
+                print("🔣 Normalized mixed-language punctuation")
+            converted_text = normalized_text
+            log_transcript_stage(session_id, "after.punctuation", converted_text)
+
             # Step 3: Strip dictation cutoff artifacts
             stripped_text = strip_trailing_final_punctuation(converted_text)
             if stripped_text != converted_text:
                 print("🧹 Stripped trailing dictation cutoff marker")
             converted_text = stripped_text
             log_transcript_stage(session_id, "after.strip_trailing", converted_text)
+
+            # A suppression replacement can intentionally remove the whole transcript.
+            if not converted_text.strip():
+                log_transcript_stage(session_id, "paste.skip_empty", converted_text)
+                print("🧹 Suppressed empty/no-speech transcript")
+                self.last_partial_text = ""
+                return
 
             # Step 4: Paste (run in executor: paste_text sleeps while injecting keys)
             loop = asyncio.get_running_loop()
@@ -1224,7 +1775,7 @@ class DictationApp:
         self.session_started_sessions.add(session_id)
         if session_id != self.active_session_id:
             return
-        print("🔌 Connected to ElevenLabs Scribe v2 Realtime")
+        print(f"🔌 Connected to ElevenLabs {self.profile['label']}")
 
     def on_partial_transcript(self, data, session_id):
         """Called when partial transcript is received"""
@@ -1236,50 +1787,65 @@ class DictationApp:
             return
 
         # Update internal state and show progress in console + live preview.
-        # Preview goes through OpenCC + replacements so Arthur reads 繁體, not
-        # whatever variant Scribe happens to emit mid-stream.
+        # Preview goes through the same text pipeline as the paste, so it reads
+        # 繁體 with the right punctuation, not whatever Scribe emits mid-stream.
         self.last_partial_text = new_text
         print(f"📝 Processing: {new_text}")
         if status_notifier:
             try:
+                held = self.live_segments.get(session_id)
+                if held:
+                    new_text = join_live_segments([*held, new_text])
                 preview_text = self.chinese_converter.convert(new_text)
                 for source, target in self.character_replacement_items:
                     preview_text = preview_text.replace(source, target)
+                preview_text = normalize_mixed_punctuation(preview_text)
             except Exception:
                 preview_text = new_text
             status_notifier.show_partial(preview_text)
 
     def on_committed_transcript(self, data, session_id):
-        """Called when final transcript is committed"""
-        commit_event = self.commit_events.get(session_id)
-        if commit_event and event_loop:
-            event_loop.call_soon_threadsafe(commit_event.set)
+        """Called when Scribe commits a piece of the transcript.
 
-        if session_id not in self.commit_events:
-            return
-
-        final_text = data.get("text", "").strip()
-        if not final_text:
-            return
-
-        log_transcript_stage(session_id, "event.committed", final_text)
-
-        # Deduplicate rapid repeated committed events for the same segment.
-        # Keep only near-identical repeats, allow same text later in long sessions.
-        now = time.monotonic()
-        last_committed = self.last_committed_text_by_session.get(session_id)
-        if last_committed:
-            last_text, last_time = last_committed
-            if last_text == final_text and (now - last_time) < 1.5:
-                log_transcript_stage(session_id, "dedupe.skip", final_text)
+        Nothing is pasted here. Scribe Live commits on its own about every 35 s
+        of a long recording; pasting those pieces right away put text into
+        whatever app had focus mid-speech. Pieces are held and pasted together
+        when the recording stops (see _cleanup_session).
+        """
+        try:
+            if session_id not in self.commit_events:
                 return
-        self.last_committed_text_by_session[session_id] = (final_text, now)
 
-        if event_loop:
-            # Schedule async processing (OpenCC + artifact cleanup + paste)
-            asyncio.run_coroutine_threadsafe(
-                self._process_final_transcript(final_text, session_id), event_loop
-            )
+            final_text = data.get("text", "").strip()
+            if not final_text:
+                return
+
+            log_transcript_stage(session_id, "event.committed", final_text)
+
+            # Deduplicate rapid repeated committed events for the same segment.
+            # Keep only near-identical repeats, allow same text later in long sessions.
+            now = time.monotonic()
+            last_committed = self.last_committed_text_by_session.get(session_id)
+            if last_committed:
+                last_text, last_time = last_committed
+                if last_text == final_text and (now - last_time) < 1.5:
+                    log_transcript_stage(session_id, "dedupe.skip", final_text)
+                    return
+            self.last_committed_text_by_session[session_id] = (final_text, now)
+
+            segments = self.live_segments.setdefault(session_id, [])
+            segments.append(final_text)
+            if session_id not in self.stopping_sessions:
+                print(
+                    f"⏸️  Holding piece {len(segments)} until you stop "
+                    f"(session {session_id})"
+                )
+        finally:
+            # Wake the stop path only after the text is stored, so the final
+            # piece is always part of the paste.
+            commit_event = self.commit_events.get(session_id)
+            if commit_event and event_loop:
+                event_loop.call_soon_threadsafe(commit_event.set)
 
     def on_error(self, error, session_id):
         """Called when an error occurs"""
@@ -1419,6 +1985,38 @@ class RightShiftPTT:
         self.pressed_devices.clear()
 
 
+def toggle_live_preview() -> str:
+    """Flip live preview on/off, save it, and show a short notice."""
+    global live_preview_enabled
+    live_preview_enabled = not live_preview_enabled
+    settings = load_settings()
+    settings["live_preview"] = live_preview_enabled
+    save_settings(settings)
+    state = "on" if live_preview_enabled else "off"
+    print(f"👁️  Live preview {state}")
+    play_sound(SOUND_START if live_preview_enabled else SOUND_STOP, 0.15)
+    if status_notifier:
+        status_notifier.set_preview(live_preview_enabled)
+        status_notifier.show_notice(
+            "即時預覽：開" if live_preview_enabled else "即時預覽：關"
+        )
+    return f"ok preview {state}"
+
+
+def toggle_transcribe_mode(app: DictationApp) -> str:
+    """Switch between live and batch, save it, and show a short notice."""
+    app.mode = "batch" if app.mode == "live" else "live"
+    settings = load_settings()
+    settings["mode"] = app.mode
+    save_settings(settings)
+    print(f"🔀 Mode {app.mode} (applies to the next recording)")
+    play_sound(SOUND_START if app.mode == "batch" else SOUND_STOP, 0.15)
+    show_overlay_notice(
+        "模式：錄完再送（batch）" if app.mode == "batch" else "模式：即時（live）"
+    )
+    return f"ok mode {app.mode}"
+
+
 async def handle_control_client(app: DictationApp, reader, writer):
     """Handle one command from dictation-ctl.py over the unix socket."""
     try:
@@ -1450,6 +2048,17 @@ async def handle_control_client(app: DictationApp, reader, writer):
             response = "ok not-recording"
     elif command == "status":
         response = "recording" if app.is_recording else "idle"
+    elif command == "preview":
+        response = toggle_live_preview()
+    elif command == "mode":
+        response = toggle_transcribe_mode(app)
+    elif command == "info":
+        response = (
+            f"{'recording' if app.is_recording else 'idle'} "
+            f"model={app.profile['model_id']} mode={app.mode} "
+            f"preview={'on' if live_preview_enabled else 'off'} "
+            f"keyterms={len(app.keyterms)}"
+        )
 
     try:
         writer.write((response + "\n").encode("utf-8"))
@@ -1484,8 +2093,14 @@ def daemon_already_running() -> bool:
         probe.close()
 
 
-async def run_daemon(chinese: str, enable_right_shift_ptt: bool = True):
-    global event_loop, status_notifier
+async def run_daemon(
+    chinese: str,
+    enable_right_shift_ptt: bool = True,
+    model: str = "v3",
+    mode: Optional[str] = None,
+    pause_media: bool = True,
+):
+    global event_loop, status_notifier, media_pauser
 
     if daemon_already_running():
         print(f"ERROR: dictation daemon already running on {SOCKET_PATH}")
@@ -1494,8 +2109,29 @@ async def run_daemon(chinese: str, enable_right_shift_ptt: bool = True):
         os.unlink(SOCKET_PATH)
 
     event_loop = asyncio.get_running_loop()
+    # systemctl stop / restart sends SIGTERM; stop the server cleanly so the
+    # finally block below runs (resume paused media, remove the socket).
+    stop_event = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            event_loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    if pause_media:
+        media_pauser = MediaPauser()
+        if media_pauser.enabled:
+            print("⏯️  Media pausing on: players that are playing pause while you record")
+
+    # No --mode: use the one last picked with Hyper+Shift+M (live the first time).
+    if mode is None:
+        mode = load_settings().get("mode")
+    if mode not in MODES:
+        mode = "live"
+
     status_notifier = create_status_indicator()
-    app = DictationApp(chinese=chinese)
+    app = DictationApp(chinese=chinese, model=model, mode=mode)
+    print(f"👁️  Live preview {'on' if live_preview_enabled else 'off'}")
 
     ptt = None
     if enable_right_shift_ptt:
@@ -1522,13 +2158,21 @@ async def run_daemon(chinese: str, enable_right_shift_ptt: bool = True):
 
     try:
         async with server:
-            await server.serve_forever()
+            serve_task = asyncio.create_task(server.serve_forever())
+            await stop_event.wait()
+            print("\n\nShutting down...")
+            serve_task.cancel()
     finally:
         if ptt:
             ptt.stop()
         if app.is_recording:
             await app.stop_recording()
             await asyncio.sleep(1)  # Give cleanup a moment
+        if media_pauser:
+            # Recording was cut short: resume anything this run paused.
+            await asyncio.get_running_loop().run_in_executor(
+                _media_executor, media_pauser.resume
+            )
         app.cleanup()
         hide_overlay()
         if isinstance(status_notifier, DotOverlay):
@@ -1539,7 +2183,7 @@ async def run_daemon(chinese: str, enable_right_shift_ptt: bool = True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Dictation daemon using ElevenLabs Scribe v2 Realtime (Linux/Wayland)"
+        description="Dictation daemon using ElevenLabs Scribe, live or batch (Linux/Wayland)"
     )
     parser.add_argument(
         "--chinese",
@@ -1551,6 +2195,25 @@ if __name__ == "__main__":
         "--disable-right-shift-ptt",
         action="store_true",
         help="Disable hold-to-talk on Right Shift (Hyper+D toggle stays enabled)",
+    )
+    parser.add_argument(
+        "--model",
+        choices=sorted(MODEL_PROFILES),
+        default="v3",
+        help="v3 (default) = Scribe v3 Live / v3 + keyterms.json + OpenCC s2tw; "
+        "v2 = Scribe v2 Realtime (old setup)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=MODES,
+        default=None,
+        help="live = stream while you speak; batch = send the whole recording when you stop. "
+        "Default: whatever was last picked with Hyper+Shift+M (live the first time)",
+    )
+    parser.add_argument(
+        "--no-pause-media",
+        action="store_true",
+        help="Do not pause music/videos while recording",
     )
     args = parser.parse_args()
 
@@ -1568,6 +2231,9 @@ if __name__ == "__main__":
             run_daemon(
                 chinese=args.chinese,
                 enable_right_shift_ptt=not args.disable_right_shift_ptt,
+                model=args.model,
+                mode=args.mode,
+                pause_media=not args.no_pause_media,
             )
         )
     except KeyboardInterrupt:

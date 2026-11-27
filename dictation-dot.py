@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Floating dictation status indicator for Wayland (GTK4 + layer-shell).
 
-A small dark capsule anchored top-center. Idle sessions show just a pulsing
+A small dark capsule anchored top-center. Idle sessions show just a steady
 red dot (recording) or orange dot (finalizing); as partial transcripts stream
-in, the capsule fluidly widens to preview what is being transcribed.
+in, the capsule widens to preview what is being transcribed, then wraps onto
+more lines. When the text outgrows MAX_LINES, the oldest words are dropped so
+the newest stay visible. Matches the macOS overlay.
 
 Runs as a child of the dictation daemon and reads commands on stdin:
-    recording | finalizing | hide | quit | partial <text>
+    recording | finalizing | hide | quit | partial <text> | notice <text>
+    | preview on | preview off
 Uses the SYSTEM python3 (needs python-gobject + gtk4-layer-shell packages) and
 must be launched with LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so.
 """
@@ -23,7 +26,9 @@ from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
 PANEL_HEIGHT = 30
 DOT_SIZE = 10
 TOP_MARGIN = 18
-MAX_TEXT_WIDTH = 460  # px; older words scroll away (ellipsized at the start)
+MAX_TEXT_WIDTH = 460  # px; longer text wraps onto the next line
+MAX_LINES = 4  # beyond this, older words scroll away (dropped at the head)
+NOTICE_MS = 1400  # how long a "預覽 開/關" notice stays up
 
 CSS = b"""
 window {
@@ -35,20 +40,15 @@ window {
 }
 #dot {
     border-radius: 5px;
-    transition: background-color 200ms ease;
 }
 #dot.recording {
     background-color: #ff453a;
-    animation: pulse 1.6s ease-in-out infinite;
 }
 #dot.finalizing {
     background-color: #ff9f0a;
-    animation: none;
 }
-@keyframes pulse {
-    0%   { opacity: 1.0; }
-    50%  { opacity: 0.35; }
-    100% { opacity: 1.0; }
+#dot.notice {
+    background-color: #0a84ff;
 }
 #preview {
     color: rgba(235, 235, 240, 0.92);
@@ -86,16 +86,18 @@ class StatusDot:
         self.dot.set_name("dot")
         self.dot.set_size_request(DOT_SIZE, DOT_SIZE)
         self.dot.set_halign(Gtk.Align.CENTER)
-        self.dot.set_valign(Gtk.Align.CENTER)
+        # The dot stays on the first line when the preview wraps.
+        self.dot.set_valign(Gtk.Align.START)
+        self.dot.set_margin_top((PANEL_HEIGHT - DOT_SIZE) // 2)
         self.dot.set_margin_start((PANEL_HEIGHT - DOT_SIZE) // 2)
         self.panel.append(self.dot)
 
         self.preview = Gtk.Label()
         self.preview.set_name("preview")
         self.preview.set_valign(Gtk.Align.CENTER)
-        self.preview.set_xalign(1.0)  # keep the newest words visible
-        self.preview.set_single_line_mode(True)
-        self.preview.set_ellipsize(Pango.EllipsizeMode.START)
+        self.preview.set_xalign(0.0)
+        self.preview.set_wrap(True)
+        self.preview.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         self.preview.set_size_request(0, -1)
         self.preview.set_visible(False)
         self.panel.append(self.preview)
@@ -104,6 +106,12 @@ class StatusDot:
         self.window.connect("realize", self._make_click_through)
 
         self.text_width = 0  # current width of the preview label
+        self.text_height = 0
+        self.mode = "hidden"  # hidden / recording / finalizing
+        self.preview_text = ""  # latest partial, kept even while preview is off
+        self.preview_enabled = True
+        self.notice_token = 0
+        self.notice_active = False
 
     def _make_click_through(self, _widget):
         surface = self.window.get_surface()
@@ -115,14 +123,56 @@ class StatusDot:
             except Exception:
                 pass
 
-    # --- preview width (no animation: instant resize reads cleaner) --------
+    # --- preview size (no animation: instant resize reads cleaner) ---------
 
-    def _measure_text_width(self) -> int:
-        layout = self.preview.create_pango_layout(self.preview.get_text())
-        width, _height = layout.get_pixel_size()
-        return min(width + 6, MAX_TEXT_WIDTH)
+    def _layout_size(self, text: str, width: int = -1) -> tuple[int, int]:
+        layout = self.preview.create_pango_layout(text)
+        if width > 0:
+            layout.set_width(width * Pango.SCALE)
+            layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        return layout.get_pixel_size()
 
-    def _apply_width(self):
+    def _line_height(self) -> int:
+        return self._layout_size("Ag測")[1]
+
+    def _fit_text(self, text: str) -> str:
+        """Size the label for text; drop the oldest words past MAX_LINES."""
+        width, height = self._layout_size(text)
+        if width + 6 <= MAX_TEXT_WIDTH:
+            self.text_width = width + 6
+            self.text_height = height
+            return text
+
+        self.text_width = MAX_TEXT_WIDTH
+        max_height = self._line_height() * MAX_LINES
+        inner = MAX_TEXT_WIDTH - 6
+        if self._layout_size(text, inner)[1] <= max_height:
+            self.text_height = self._layout_size(text, inner)[1]
+            return text
+
+        # Binary-search the smallest cut that fits, keeping the newest words.
+        low, high = 1, len(text) - 1
+        while low < high:
+            mid = (low + high) // 2
+            if self._layout_size("…" + text[mid:], inner)[1] <= max_height:
+                high = mid
+            else:
+                low = mid + 1
+        text = "…" + text[low:]
+        self.text_height = self._layout_size(text, inner)[1]
+        return text
+
+    def _set_text(self, text: str):
+        """Show text in the capsule, or collapse to just the dot when empty."""
+        if text:
+            self.preview.set_text(self._fit_text(text))
+        else:
+            self.preview.set_text("")
+            self.text_width = 0
+            self.text_height = 0
+        self._apply_size()
+
+    def _apply_size(self):
         width = max(0, int(self.text_width))
         if width <= 0:
             self.preview.set_visible(False)
@@ -132,41 +182,85 @@ class StatusDot:
         else:
             self.preview.set_visible(True)
             self.preview.set_size_request(width, -1)
-            self.panel.set_size_request(
-                PANEL_HEIGHT + width + 12, PANEL_HEIGHT
-            )
+            line = self._line_height()
+            height = PANEL_HEIGHT + max(0, self.text_height - line)
+            self.preview.set_margin_top((PANEL_HEIGHT - line) // 2)
+            self.preview.set_margin_bottom((PANEL_HEIGHT - line) // 2)
+            self.panel.set_size_request(PANEL_HEIGHT + width + 12, height)
+        # Shrink the layer surface back down after a wide/tall preview.
+        self.window.set_default_size(1, 1)
+
+    def _set_dot(self, css_class):
+        for name in ("recording", "finalizing", "notice"):
+            self.dot.remove_css_class(name)
+        self.dot.add_css_class(css_class)
+
+    def _render_session(self):
+        """Redraw the recording/finalizing view from the current state."""
+        self._set_dot("finalizing" if self.mode == "finalizing" else "recording")
+        self._set_text(self.preview_text if self.preview_enabled else "")
+        self.window.present()
+
+    def _cancel_notice(self):
+        self.notice_token += 1
+        self.notice_active = False
 
     # --- commands ---------------------------------------------------------
 
-    def _set_state(self, css_class):
-        self.dot.remove_css_class("recording")
-        self.dot.remove_css_class("finalizing")
-        self.dot.add_css_class(css_class)
-
     def show_recording(self):
-        self.preview.set_text("")
-        self.text_width = 0
-        self._apply_width()
-        self._set_state("recording")
-        self.window.present()
+        self._cancel_notice()
+        self.mode = "recording"
+        self.preview_text = ""
+        self._render_session()
 
     def show_finalizing(self):
-        self._set_state("finalizing")
-        self.window.present()
+        self.mode = "finalizing"
+        if not self.notice_active:
+            self._render_session()
 
     def show_partial(self, text: str):
         text = text.strip()
         if not text:
             return
-        self.preview.set_text(text)
-        self.text_width = self._measure_text_width()
-        self._apply_width()
+        self.preview_text = text
+        if self.preview_enabled and not self.notice_active and self.mode != "hidden":
+            self._set_text(text)
+
+    def set_preview(self, enabled: bool):
+        self.preview_enabled = enabled
+        if self.mode != "hidden" and not self.notice_active:
+            self._render_session()
+
+    def show_notice(self, text: str):
+        """Briefly show a message (e.g. preview toggled), then go back."""
+        self.notice_token += 1
+        token = self.notice_token
+        self.notice_active = True
+        self._set_dot("notice")
+        self._set_text(text)
+        self.window.present()
+        GLib.timeout_add(NOTICE_MS, self._end_notice, token)
+
+    def _end_notice(self, token: int):
+        if token != self.notice_token:
+            return False  # a newer notice or a new recording took over
+        self.notice_active = False
+        if self.mode == "hidden":
+            self.hide()
+        else:
+            self._render_session()
+        return False
 
     def hide(self):
+        self.mode = "hidden"
+        self.preview_text = ""
+        if self.notice_active:
+            return  # let the notice finish; _end_notice hides afterwards
         self.window.set_visible(False)
         self.preview.set_text("")
         self.text_width = 0
-        self._apply_width()
+        self.text_height = 0
+        self._apply_size()
 
 
 def main():
@@ -190,17 +284,26 @@ def main():
                 return False
             command = line.rstrip("\n")
             dot = holder["dot"]
-            if command == "recording":
-                dot.show_recording()
-            elif command == "finalizing":
-                dot.show_finalizing()
-            elif command == "hide":
-                dot.hide()
-            elif command == "quit":
-                gtk_app.quit()
-                return False
-            elif command.startswith("partial "):
-                dot.show_partial(command[len("partial "):])
+            try:
+                if command == "recording":
+                    dot.show_recording()
+                elif command == "finalizing":
+                    dot.show_finalizing()
+                elif command == "hide":
+                    dot.hide()
+                elif command == "quit":
+                    gtk_app.quit()
+                    return False
+                elif command.startswith("partial "):
+                    dot.show_partial(command[len("partial "):])
+                elif command.startswith("notice "):
+                    dot.show_notice(command[len("notice "):])
+                elif command == "preview on":
+                    dot.set_preview(True)
+                elif command == "preview off":
+                    dot.set_preview(False)
+            except Exception as e:  # never let one bad command kill the dot
+                print(f"dictation-dot: {command!r} failed: {e}", file=sys.stderr)
             return True
 
         channel = GLib.IOChannel.unix_new(sys.stdin.fileno())

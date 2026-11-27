@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Control client for the dictation daemon. Stdlib-only, fast to launch.
 
-Usage: dictation-ctl.py {toggle|start|stop|status}
-Meant to be bound in Hyprland (Hyper+D -> toggle).
+Usage: dictation-ctl.py {toggle|start|stop|status|preview|mode|info}
+Meant to be bound in Hyprland: Hyper+D -> toggle, Hyper+Shift+D -> preview,
+Hyper+Shift+M -> mode (live/batch).
 """
 
 import os
@@ -12,7 +13,7 @@ import sys
 SOCKET_PATH = os.path.join(
     os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "dictation-app.sock"
 )
-COMMANDS = ("toggle", "start", "stop", "status")
+COMMANDS = ("toggle", "start", "stop", "status", "preview", "mode", "info")
 
 
 def main() -> int:
