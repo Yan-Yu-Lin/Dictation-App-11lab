@@ -851,6 +851,39 @@ def normalize_mixed_punctuation(text: str) -> str:
     return "".join(out)
 
 
+DASH_RUN_RE = re.compile(r"\s*[—–―]+\s*")
+
+
+def remove_em_dashes(text: str) -> str:
+    """Drop the em/en dashes Scribe writes for pauses and restarts.
+
+    Scribe (v3 Live especially) marks a pause or a changed thought with "——"
+    ("我待會我就——你要幫我"); there is no API option to turn that off. The dash
+    is removed; between two English words it becomes ", " so they don't run
+    together; before Chinese text after English, a space is kept. Plain hyphens
+    ("render-patch", "-") are not touched.
+    """
+
+    def replace(match: re.Match) -> str:
+        before = text[: match.start()]
+        after = text[match.end() :]
+        prev = before[-1:] if before else ""
+        nxt = after[:1]
+        prev_latin = prev.isascii() and prev.isalnum()
+        next_latin = nxt.isascii() and nxt.isalnum()
+        if not prev or not nxt:
+            return ""  # at the start or end: just drop it
+        if prev_latin and next_latin:
+            return ", "  # "devices——it's" -> "devices, it's"
+        if prev_latin or next_latin:
+            return " "  # "上面—— Your agent" -> "上面 Your agent"; "連——Line" -> "連 Line"
+        if prev in "，。？！、；：,.?!;:" or nxt in "，。？！、；：,.?!;:":
+            return ""
+        return "，"  # Chinese on both sides: a comma keeps the pause readable
+
+    return DASH_RUN_RE.sub(replace, text)
+
+
 def join_live_segments(segments: list[str]) -> str:
     """Join the pieces Scribe Live committed during one recording into one text.
 
@@ -1964,6 +1997,12 @@ class DictationApp:
                 session_id, "after.character_replacements", converted_text
             )
 
+            # Step 2a: no em dashes (Scribe's "——" for pauses and restarts).
+            dashless_text = remove_em_dashes(converted_text)
+            if dashless_text != converted_text:
+                print("➖ Removed em dashes")
+            converted_text = dashless_text
+
             # Step 2b: English sentences get English punctuation, Chinese ones Chinese.
             normalized_text = normalize_mixed_punctuation(converted_text)
             if normalized_text != converted_text:
@@ -2057,7 +2096,7 @@ class DictationApp:
                 preview_text = self.chinese_converter.convert(new_text)
                 for source, target in self.character_replacement_items:
                     preview_text = preview_text.replace(source, target)
-                preview_text = normalize_mixed_punctuation(preview_text)
+                preview_text = normalize_mixed_punctuation(remove_em_dashes(preview_text))
             except Exception:
                 preview_text = new_text
             status_notifier.show_partial(preview_text)
